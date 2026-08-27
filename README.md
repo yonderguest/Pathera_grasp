@@ -63,6 +63,8 @@ pathera_grasp/
 ├── mobileclip2_b.ts                                   # YOLOE MobileCLIP 文本编码器
 ├── models/
 │   └── yoloe-26s-seg.pt                               # YOLOE 分割权重
+├── tools/
+│   └── test_graspnet_offline.py                       # GraspNet 候选离线验证
 └── Panthera-HT_SDK/
     └── panthera_python/
         ├── Panthera-HT_description/                   # URDF 与 mesh，运动学加载依赖
@@ -214,6 +216,14 @@ git clone https://github.com/graspnet/graspnetAPI.git third_party/graspnetAPI
 
 ```text
 third_party/graspnet-baseline/checkpoint-rs.tar
+```
+
+可先在不连接机械臂的情况下用保存好的 RGB-D 图片检查候选：
+
+```bash
+python tools/test_graspnet_offline.py \
+  --data-dir /path/to/saved_frame \
+  --checkpoint third_party/graspnet-baseline/checkpoint-rs.tar
 ```
 
 然后在 `grasp_config.py` 中设置：
