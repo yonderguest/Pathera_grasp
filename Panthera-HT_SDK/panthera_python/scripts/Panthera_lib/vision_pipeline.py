@@ -155,6 +155,7 @@ class CameraFeed:
                     }
                     self._latest_for_scan = {
                         "color_image": color_image,
+                        "depth_image": depth_image,
                         "detections": list(self._detections),
                         "timestamp": timestamp,
                         "detections_timestamp": self._detections_timestamp,
