@@ -24,13 +24,22 @@ class GraspConfig:
     camera_detection_interval: float = 0.25
     camera_detection_timeout: float = 3.0
 
+    # Qualcomm QNN HTP NPU detector.  Disabled by default so the CPU YOLOE
+    # path remains the safe fallback.
+    use_npu: bool = False
+    npu_server_path: str = "third_party/qnn/npu_server"
+    npu_context_path: str = "third_party/qnn/yoloe-26s-seg_640_iq9075_qnn_brick6.bin"
+    npu_input_size: int = 640
+    npu_output_specs: str = "output_0:1,300,38;output_1:1,32,160,160"
+    npu_confidence_threshold: float = 0.05
+
     # GraspNet integration. Kept disabled by default so the existing OBB
     # grasp path remains the safety fallback while GraspNet is evaluated.
     use_graspnet: bool = False
     graspnet_repo_path: str = "third_party/graspnet-baseline"
     graspnet_api_path: str = "third_party/graspnetAPI"
     graspnet_checkpoint_path: str = "third_party/graspnet-baseline/checkpoint-rs.tar"
-    graspnet_num_point: int = 20000
+    graspnet_num_point: int = 1024
     graspnet_pc_radius: float = 1.0
     graspnet_score_threshold: float = 0.0
     graspnet_max_candidates: int = 20

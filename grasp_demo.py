@@ -47,6 +47,7 @@ from Panthera_lib.Panthera import Panthera  # noqa: E402
 from Panthera_lib.graspnet_pipeline import (  # noqa: E402
     GraspNetCandidateProvider,
 )
+from Panthera_lib.npu_inference import NpuYoloDetector  # noqa: E402
 
 
 shutdown_requested = threading.Event()
@@ -101,6 +102,7 @@ def build_config():
     config.text_encoder_path = TEXT_ENCODER_PATH
     config.calibration_file = CALIBRATION_FILE
     config.use_graspnet = os.environ.get("GRASPNET_USE", "0") == "1"
+    config.use_npu = os.environ.get("YOLO_NPU", "0") == "1"
     config.graspnet_checkpoint_path = os.environ.get(
         "GRASPNET_CHECKPOINT_PATH", config.graspnet_checkpoint_path
     )
@@ -118,6 +120,7 @@ def main():
     pipeline = None
     streamer = None
     camera_feed = None
+    npu_detector = None
     config = build_config()
     last_command = config.zero.copy()
     try:
@@ -167,9 +170,16 @@ def main():
         planner.open_gripper()
 
         tcp_camera = load_hand_eye(config)
-        model = load_target_model(config)
-        camera_feed.set_model(model)
-        safe_print("[VISION] YOLOE model loaded.")
+        if config.use_npu:
+            npu_detector = NpuYoloDetector(
+                config, confidence=config.npu_confidence_threshold
+            )
+            camera_feed.set_npu_detector(npu_detector)
+            safe_print("[VISION] YOLOE NPU detector ready.")
+        else:
+            model = load_target_model(config)
+            camera_feed.set_model(model)
+            safe_print("[VISION] YOLOE model loaded.")
 
         task_complete = planner.run_grasp_loop(
             camera_feed,
@@ -185,6 +195,8 @@ def main():
     finally:
         if camera_feed is not None:
             camera_feed.stop()
+        if npu_detector is not None:
+            npu_detector.close()
         if streamer is not None:
             safe_print("[STREAM] closing web preview ...")
             streamer.stop()

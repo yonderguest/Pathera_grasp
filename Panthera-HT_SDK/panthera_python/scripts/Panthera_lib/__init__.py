@@ -9,6 +9,7 @@ __all__ = [
     "GraspPlanner",
     "VisionStreamer",
     "GraspNetCandidateProvider",
+    "NpuYoloDetector",
 ]
 
 
@@ -33,4 +34,8 @@ def __getattr__(name):
         from .graspnet_pipeline import GraspNetCandidateProvider
 
         return GraspNetCandidateProvider
+    if name == "NpuYoloDetector":
+        from .npu_inference import NpuYoloDetector
+
+        return NpuYoloDetector
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

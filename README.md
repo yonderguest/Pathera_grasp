@@ -65,7 +65,8 @@ pathera_grasp/
 │   └── yoloe-26s-seg.pt                               # YOLOE 分割权重
 ├── third_party/
 │   ├── graspnet-baseline/                             # GraspNet 模型与 CPU PointNet++ 实现
-│   └── graspnetAPI/                                   # GraspGroup、NMS、碰撞过滤
+│   ├── graspnetAPI/                                   # GraspGroup、NMS、碰撞过滤
+│   └── qnn/                                           # QNN HTP npu_server 与 YOLOE 上下文
 ├── tools/
 │   └── test_graspnet_offline.py                       # GraspNet 候选离线验证
 └── Panthera-HT_SDK/
@@ -81,6 +82,7 @@ pathera_grasp/
                 ├── grasp_config.py            # 抓取工作流配置
                 ├── vision_pipeline.py         # 相机、检测、位姿计算
                 ├── vision_streamer.py         # 网页 MJPEG 推流与可视化
+                ├── npu_inference.py           # QNN HTP NPU 检测器封装
                 ├── graspnet_pipeline.py       # 可选：GraspNet 候选生成与坐标转换
                 └── grasp_planner.py           # 高层规划、执行、安全停机
 ```
@@ -145,6 +147,15 @@ Panthera 机械臂的底层库，继承 `hightorque_robot.Robot`。保留：
 - YOLO 分割 mask、检测框和文字标注
 - 局域网 `0.0.0.0:8080` 访问
 
+### `npu_inference.py`
+
+封装 QNN HTP 上的 YOLOE NPU 检测器：
+
+- 管理 `npu_server` 常驻进程
+- 输入 `1x3x640x640` 浮点图像
+- 输出检测框、类别、置信度和实例 mask
+- 配合 `vision_pipeline.detect_targets_npu()` 转换为项目统一的检测格式
+
 ### `graspnet_pipeline.py`
 
 可选模块，仅在 `use_graspnet=True` 时加载。它只负责视觉侧候选生成：
@@ -203,6 +214,29 @@ python grasp_demo.py
 
 启动后按提示输入颜色即可。退出输入 `q`，或者按 `Ctrl+C`。
 
+## 启用 NPU 目标识别
+
+项目已经接入 Qualcomm QNN HTP NPU。开启后 YOLOE 目标检测从 CPU 切换到 NPU：
+
+```bash
+YOLO_NPU=1 python grasp_demo.py
+```
+
+NPU 使用的资源：
+
+```text
+third_party/qnn/npu_server
+third_party/qnn/yoloe-26s-seg_640_iq9075_qnn_brick6.bin
+```
+
+当前 NPU 模型是 6 类积木封闭集模型，HSV 颜色投票仍然在 CPU 完成。默认 NPU 置信度阈值为 `0.05`，可以在 `grasp_config.py` 中通过 `npu_confidence_threshold` 调整。
+
+同时启用 NPU 和 GraspNet：
+
+```bash
+YOLO_NPU=1 GRASPNET_USE=1 python grasp_demo.py
+```
+
 ## 启用 GraspNet 候选
 
 当前默认关闭。项目已经内置两个第三方仓库：
@@ -233,6 +267,14 @@ Python 环境仍保持：
 numpy 1.26.4
 torch 2.13.0+cpu
 ```
+
+为了降低 CPU 推理耗时，GraspNet 输入点数已从原来的 `20000` 调整为：
+
+```text
+graspnet_num_point = 1024
+```
+
+如果实际抓取中发现 1024 点导致候选质量不足，可以再逐步提高到 `2048`。
 
 ### checkpoint
 
@@ -282,6 +324,7 @@ export GRASPNET_CHECKPOINT_PATH=/path/to/checkpoint-rs.tar
 
 - `Panthera.py` 只负责机械臂底层能力。
 - `vision_pipeline.py` 只负责视觉和几何计算。
+- `npu_inference.py` 只负责 QNN HTP 检测器封装。
 - `graspnet_pipeline.py` 只负责 GraspNet 候选生成和坐标转换。
 - `grasp_planner.py` 只负责抓取任务编排。
 - `grasp_demo.py` 只负责入口和用户交互。

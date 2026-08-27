@@ -75,6 +75,7 @@ class CameraFeed:
         self.depth_scale = depth_scale
         self.streamer = streamer
         self.model = model
+        self.npu_detector = None
 
         self._lock = threading.Lock()
         self._stop_event = threading.Event()
@@ -91,6 +92,9 @@ class CameraFeed:
 
     def set_model(self, model) -> None:
         self.model = model
+
+    def set_npu_detector(self, detector) -> None:
+        self.npu_detector = detector
 
     def start(self) -> None:
         self._capture_thread = threading.Thread(
@@ -166,16 +170,16 @@ class CameraFeed:
     def _inference_loop(self) -> None:
         while not self._stop_event.is_set():
             model = self.model
-            if model is None:
+            if model is None and self.npu_detector is None:
                 time.sleep(0.02)
                 continue
 
             with self._lock:
                 capture = self._latest_capture
 
-            if (
-                capture is None
-                or capture["timestamp"] == self._last_inference_capture_timestamp
+            if capture is None or (
+                self.npu_detector is None
+                and capture["timestamp"] == self._last_inference_capture_timestamp
             ):
                 time.sleep(0.01)
                 continue
@@ -189,13 +193,22 @@ class CameraFeed:
             depth_image = capture["depth_image"]
             timestamp = capture["timestamp"]
             try:
-                detections = detect_targets(
-                    model,
-                    color_image,
-                    depth_image,
-                    self.depth_scale,
-                    self.config,
-                )
+                if self.npu_detector is not None:
+                    detections = detect_targets_npu(
+                        self.npu_detector,
+                        color_image,
+                        depth_image,
+                        self.depth_scale,
+                        self.config,
+                    )
+                else:
+                    detections = detect_targets(
+                        model,
+                        color_image,
+                        depth_image,
+                        self.depth_scale,
+                        self.config,
+                    )
             except Exception as exc:
                 self._report_error(exc)
                 self._last_inference_capture_timestamp = timestamp
@@ -376,6 +389,50 @@ def detect_targets(model, color_image, depth_frame, depth_scale, config: GraspCo
             conf,
             (x1, y1, x2, y2),
             mask,
+            color_image,
+            depth_frame,
+            depth_scale,
+            config,
+        )
+        if detection is not None:
+            detections.append(detection)
+    return detections
+
+
+def detect_targets_npu(
+    npu_detector,
+    color_image,
+    depth_frame,
+    depth_scale,
+    config: GraspConfig,
+):
+    """Run the QNN HTP detector and convert its outputs to the same detection
+    dictionaries used by the CPU YOLOE path.
+    """
+    raw_detections = npu_detector.infer(color_image)
+    detections = []
+    for raw in raw_detections:
+        x1, y1, x2, y2 = [int(value) for value in raw["box"]]
+        crop = np.asarray(raw["mask"], dtype=np.float32)
+        if crop.shape[:2] != (y2 - y1, x2 - x1):
+            crop = cv2.resize(
+                crop, (max(1, x2 - x1), max(1, y2 - y1)),
+                interpolation=cv2.INTER_NEAREST,
+            )
+        full_mask = np.zeros(color_image.shape[:2], dtype=np.float32)
+        y1 = max(0, min(y1, color_image.shape[0] - 1))
+        y2 = max(0, min(y2, color_image.shape[0]))
+        x1 = max(0, min(x1, color_image.shape[1] - 1))
+        x2 = max(0, min(x2, color_image.shape[1]))
+        full_mask[y1:y2, x1:x2] = crop[: y2 - y1, : x2 - x1]
+
+        cls = int(raw["cls"])
+        name = npu_detector.names[cls] if cls < len(npu_detector.names) else "object"
+        detection = _detection_from_result(
+            name,
+            float(raw["conf"]),
+            (x1, y1, x2, y2),
+            full_mask,
             color_image,
             depth_frame,
             depth_scale,
