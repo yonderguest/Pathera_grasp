@@ -100,6 +100,7 @@ def build_config():
     config.project_root = PROJECT_ROOT
     config.text_encoder_path = TEXT_ENCODER_PATH
     config.calibration_file = CALIBRATION_FILE
+    config.use_graspnet = os.environ.get("GRASPNET_USE", "0") == "1"
     config.graspnet_checkpoint_path = os.environ.get(
         "GRASPNET_CHECKPOINT_PATH", config.graspnet_checkpoint_path
     )
