@@ -236,13 +236,13 @@ torch 2.13.0+cpu
 
 ### checkpoint
 
-官方 RealSense checkpoint 需要放到：
+官方 RealSense checkpoint 已放入：
 
 ```text
 third_party/graspnet-baseline/checkpoint-rs.tar
 ```
 
-官方 Google Drive 链接在当前网络环境下不可直接访问。建议从其他已下载来源或百度网盘获取 `checkpoint-rs.tar` 后放到上述路径。
+当前机器已成功使用该 checkpoint 加载 GraspNet 模型并生成候选。
 
 ### 验证
 
