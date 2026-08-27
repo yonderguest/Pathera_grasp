@@ -63,6 +63,9 @@ pathera_grasp/
 ├── mobileclip2_b.ts                                   # YOLOE MobileCLIP 文本编码器
 ├── models/
 │   └── yoloe-26s-seg.pt                               # YOLOE 分割权重
+├── third_party/
+│   ├── graspnet-baseline/                             # GraspNet 模型与 CPU PointNet++ 实现
+│   └── graspnetAPI/                                   # GraspGroup、NMS、碰撞过滤
 ├── tools/
 │   └── test_graspnet_offline.py                       # GraspNet 候选离线验证
 └── Panthera-HT_SDK/
@@ -202,21 +205,46 @@ python grasp_demo.py
 
 ## 启用 GraspNet 候选
 
-当前默认关闭。要尝试 GraspNet 抓取路径，需要先把依赖放到项目内：
+当前默认关闭。项目已经内置两个第三方仓库：
 
-```bash
-cd pathera_grasp
-mkdir -p third_party
-
-git clone https://github.com/graspnet/graspnet-baseline.git third_party/graspnet-baseline
-git clone https://github.com/graspnet/graspnetAPI.git third_party/graspnetAPI
+```text
+third_party/
+├── graspnet-baseline/
+└── graspnetAPI/
 ```
 
-按官方说明安装依赖，并把 RealSense checkpoint 放到：
+本机板端是 `aarch64 + CPU-only torch`，官方 `pointnet2` CUDA 算子无法使用。项目内已经把 `third_party/graspnet-baseline/pointnet2/pointnet2_utils.py` 替换为 CPU 版实现，`knn` 也已编译 CPU 版本。
+
+### 依赖安装状态
+
+当前 `pathera_grasp` 环境已安装：
+
+- `graspnetAPI`
+- `open3d`
+- `trimesh`
+- `transforms3d`
+- `grasp_nms`
+- `knn_pytorch` CPU 版
+- 其余 graspnetAPI 依赖
+
+Python 环境仍保持：
+
+```text
+numpy 1.26.4
+torch 2.13.0+cpu
+```
+
+### checkpoint
+
+官方 RealSense checkpoint 需要放到：
 
 ```text
 third_party/graspnet-baseline/checkpoint-rs.tar
 ```
+
+官方 Google Drive 链接在当前网络环境下不可直接访问。建议从其他已下载来源或百度网盘获取 `checkpoint-rs.tar` 后放到上述路径。
+
+### 验证
 
 可先在不连接机械臂的情况下用保存好的 RGB-D 图片检查候选：
 
