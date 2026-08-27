@@ -24,6 +24,30 @@ class GraspConfig:
     camera_detection_interval: float = 0.25
     camera_detection_timeout: float = 3.0
 
+    # GraspNet integration. Kept disabled by default so the existing OBB
+    # grasp path remains the safety fallback while GraspNet is evaluated.
+    use_graspnet: bool = False
+    graspnet_repo_path: str = "third_party/graspnet-baseline"
+    graspnet_api_path: str = "third_party/graspnetAPI"
+    graspnet_checkpoint_path: str = "third_party/graspnet-baseline/checkpoint-rs.tar"
+    graspnet_num_point: int = 20000
+    graspnet_pc_radius: float = 1.0
+    graspnet_score_threshold: float = 0.0
+    graspnet_max_candidates: int = 20
+    graspnet_nms_translation: float = 0.02
+    graspnet_nms_rotation: float = 30.0
+    graspnet_collision_voxel_size: float = 0.01
+    graspnet_collision_thresh: float = 0.01
+    graspnet_collision_approach_dist: float = 0.05
+    graspnet_gripper_fix_rotation: np.ndarray = field(
+        default_factory=lambda: np.eye(3, dtype=float),
+        repr=False,
+    )
+    graspnet_pre_grasp_offset: float = 0.05
+    graspnet_lift_distance: float = 0.08
+    graspnet_manipulability_min: float = 0.0
+    graspnet_max_joint_jump: float = 1.2
+
     width: int = 640
     height: int = 480
     fps: int = 30
@@ -155,6 +179,14 @@ class GraspConfig:
             raise ValueError("manual_grasp_rotation is not orthonormal")
         if not np.isclose(np.linalg.det(self.manual_grasp_rotation), 1.0, atol=2e-3):
             raise ValueError("manual_grasp_rotation must be right handed")
+        if not np.allclose(
+            self.graspnet_gripper_fix_rotation.T @ self.graspnet_gripper_fix_rotation,
+            np.eye(3),
+            atol=2e-3,
+        ):
+            raise ValueError("graspnet_gripper_fix_rotation is not orthonormal")
+        if not np.isclose(np.linalg.det(self.graspnet_gripper_fix_rotation), 1.0, atol=2e-3):
+            raise ValueError("graspnet_gripper_fix_rotation must be right handed")
         for name, pose in (("PUT1", self.put1), ("PUT2", self.put2)):
             if np.any(pose < self.joint_lower) or np.any(pose > self.joint_upper):
                 raise ValueError(f"{name} exceeds the configured joint limits")

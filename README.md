@@ -76,6 +76,7 @@ pathera_grasp/
                 ├── grasp_config.py            # 抓取工作流配置
                 ├── vision_pipeline.py         # 相机、检测、位姿计算
                 ├── vision_streamer.py         # 网页 MJPEG 推流与可视化
+                ├── graspnet_pipeline.py       # 可选：GraspNet 候选生成与坐标转换
                 └── grasp_planner.py           # 高层规划、执行、安全停机
 ```
 
@@ -113,8 +114,11 @@ Panthera 机械臂的底层库，继承 `hightorque_robot.Robot`。保留：
 - 工作空间保护范围
 - HSV 颜色判断阈值
 - 颜色语言命令解析
+- GraspNet 开关、checkpoint 路径、NMS/碰撞过滤和抓取候选参数
 
 这样上层逻辑不再散落大量魔法数字。
+
+`use_graspnet` 默认是 `False`，因此项目仍默认使用稳定的 OBB/Seeed 几何抓取路径；只有显式打开后才会切换到 GraspNet 候选生成。
 
 ### `vision_pipeline.py`
 
@@ -135,6 +139,17 @@ Panthera 机械臂的底层库，继承 `hightorque_robot.Robot`。保留：
 - 原始 RGB 画面 MJPEG 推流
 - YOLO 分割 mask、检测框和文字标注
 - 局域网 `0.0.0.0:8080` 访问
+
+### `graspnet_pipeline.py`
+
+可选模块，仅在 `use_graspnet=True` 时加载。它只负责视觉侧候选生成：
+
+- 从 YOLO 目标 mask 提取 RGB-D 点云
+- 调用 `graspnet-baseline` 生成 6-DOF 抓取候选
+- 使用 `graspnetAPI` 做 NMS、分数排序和碰撞过滤
+- 将相机系抓取位姿转换到机械臂基座系
+
+不直接控制机械臂。抓取候选的 workspace、IK、关节跳变等验证仍由 `grasp_planner.py` 完成。
 
 ### `grasp_planner.py`
 
@@ -183,6 +198,38 @@ python grasp_demo.py
 
 启动后按提示输入颜色即可。退出输入 `q`，或者按 `Ctrl+C`。
 
+## 启用 GraspNet 候选
+
+当前默认关闭。要尝试 GraspNet 抓取路径，需要先把依赖放到项目内：
+
+```bash
+cd pathera_grasp
+mkdir -p third_party
+
+git clone https://github.com/graspnet/graspnet-baseline.git third_party/graspnet-baseline
+git clone https://github.com/graspnet/graspnetAPI.git third_party/graspnetAPI
+```
+
+按官方说明安装依赖，并把 RealSense checkpoint 放到：
+
+```text
+third_party/graspnet-baseline/checkpoint-rs.tar
+```
+
+然后在 `grasp_config.py` 中设置：
+
+```python
+use_graspnet = True
+```
+
+或从环境变量覆盖 checkpoint：
+
+```bash
+export GRASPNET_CHECKPOINT_PATH=/path/to/checkpoint-rs.tar
+```
+
+> GraspNet 的夹爪坐标系可能与 Panthera 末端坐标系不完全一致。应先离线可视化候选位姿，调整 `graspnet_gripper_fix_rotation`，再上真机低速验证。
+
 `pathera_grasp` 是当前板端专用 Conda 环境，已经包含：
 
 - 机械臂：`hightorque_robot`、`pinocchio`、`scipy`、`numpy<2`
@@ -197,5 +244,6 @@ python grasp_demo.py
 
 - `Panthera.py` 只负责机械臂底层能力。
 - `vision_pipeline.py` 只负责视觉和几何计算。
+- `graspnet_pipeline.py` 只负责 GraspNet 候选生成和坐标转换。
 - `grasp_planner.py` 只负责抓取任务编排。
 - `grasp_demo.py` 只负责入口和用户交互。

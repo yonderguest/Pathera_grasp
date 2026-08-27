@@ -22,10 +22,17 @@ from .vision_pipeline import (
 class GraspPlanner:
     """Coordinate the Panthera robot through the visual grasp workflow."""
 
-    def __init__(self, robot, config: GraspConfig, interrupt_event: threading.Event):
+    def __init__(
+        self,
+        robot,
+        config: GraspConfig,
+        interrupt_event: threading.Event,
+        graspnet_provider=None,
+    ):
         self.robot = robot
         self.config = config
         self.interrupted = interrupt_event
+        self.graspnet_provider = graspnet_provider
 
     @contextlib.contextmanager
     def sdk_call(self):
@@ -348,6 +355,78 @@ class GraspPlanner:
         pose[0] = float(joint1)
         return pose
 
+    def _select_graspnet_candidate(
+        self,
+        camera_feed,
+        capture,
+        intrinsic,
+        base_camera,
+        matches,
+        scan_joint_position,
+        joint1,
+        label,
+    ):
+        """Choose the highest-scoring GraspNet candidate that is reachable."""
+        cfg = self.config
+        if self.graspnet_provider is None:
+            raise RuntimeError(
+                "use_graspnet is enabled but no GraspNetCandidateProvider was passed"
+            )
+
+        for detection in matches:
+            candidates = self.graspnet_provider.generate_candidates(
+                capture["color_image"],
+                capture["depth_image"],
+                detection,
+                intrinsic,
+                camera_feed.depth_scale,
+                base_camera,
+            )
+            for candidate in candidates:
+                joint6_target = np.asarray(candidate["joint6_target"], dtype=float)
+                tool_rotation = np.asarray(candidate["tool_rotation"], dtype=float)
+                tool_target = np.asarray(candidate["tool_target"], dtype=float)
+                if not workspace_ok(tool_target, joint6_target, cfg):
+                    continue
+
+                provisional = self.solve_ik(
+                    joint6_target,
+                    tool_rotation,
+                    cfg.manual_grasp_ik_seed,
+                    cfg.graspnet_max_joint_jump,
+                )
+                if provisional is None:
+                    print(
+                        f"[{label}] J1={joint1:+.2f}: "
+                        f"GraspNet candidate score={candidate['score']:.3f} "
+                        "is unreachable."
+                    )
+                    continue
+
+                print("\n" + "=" * 68)
+                print(f"[{label}] GraspNet candidate accepted at J1={joint1:+.2f} rad")
+                print(f"Target          : {detection['class_name']} ({detection['color']})")
+                print(f"Confidence      : {detection['confidence']:.3f}")
+                print(f"Color vote      : {detection['color_confidence']:.1%}")
+                print(f"Depth           : {detection['depth_m']:.3f} m")
+                print(f"Grasp score     : {candidate['score']:.3f}")
+                print(f"Gripper width   : {candidate['gripper_width']:.3f} m")
+                print(f"Tool target     : {np.round(tool_target, 3)} m")
+                print(f"Joint6 target   : {np.round(joint6_target, 3)} m")
+                print("=" * 68)
+                return {
+                    "joint6_target": joint6_target,
+                    "tool_rotation": tool_rotation,
+                    "tool_target": tool_target,
+                    "scan_joint1": joint1,
+                    "scan_joint_position": scan_joint_position,
+                    "score": candidate["score"],
+                    "gripper_width": candidate["gripper_width"],
+                }
+
+        print(f"[{label}] J1={joint1:+.2f}: no reachable GraspNet candidate.")
+        return None
+
     def _detect_at_pose(
         self,
         camera_feed,
@@ -379,6 +458,18 @@ class GraspPlanner:
             return None
 
         scan_joint_position = self.current_joint_position()
+        if cfg.use_graspnet:
+            return self._select_graspnet_candidate(
+                camera_feed,
+                capture,
+                intrinsic,
+                base_camera,
+                matches,
+                scan_joint_position,
+                joint1,
+                label,
+            )
+
         for detection in matches:
             camera_point, base_point = object_base_position(
                 detection, intrinsic, base_camera

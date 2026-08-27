@@ -44,6 +44,9 @@ from Panthera_lib.vision_pipeline import (  # noqa: E402
 )
 from Panthera_lib.vision_streamer import VisionStreamer  # noqa: E402
 from Panthera_lib.Panthera import Panthera  # noqa: E402
+from Panthera_lib.graspnet_pipeline import (  # noqa: E402
+    GraspNetCandidateProvider,
+)
 
 
 shutdown_requested = threading.Event()
@@ -97,6 +100,9 @@ def build_config():
     config.project_root = PROJECT_ROOT
     config.text_encoder_path = TEXT_ENCODER_PATH
     config.calibration_file = CALIBRATION_FILE
+    config.graspnet_checkpoint_path = os.environ.get(
+        "GRASPNET_CHECKPOINT_PATH", config.graspnet_checkpoint_path
+    )
     config.stream_host = os.environ.get("VISION_STREAM_HOST", "0.0.0.0")
     config.stream_port = int(os.environ.get("VISION_STREAM_PORT", "8080"))
     config.stream_jpeg_quality = int(
@@ -141,7 +147,18 @@ def main():
         safe_print("[VISION] camera preview started.")
 
         robot = Panthera(config.robot_config)
-        planner = GraspPlanner(robot, config, shutdown_requested)
+        graspnet_provider = None
+        if config.use_graspnet:
+            safe_print("[GRASPNET] loading GraspNet candidate provider ...")
+            graspnet_provider = GraspNetCandidateProvider(config)
+            graspnet_provider.load()
+            safe_print("[GRASPNET] GraspNet candidate provider loaded.")
+        planner = GraspPlanner(
+            robot,
+            config,
+            shutdown_requested,
+            graspnet_provider=graspnet_provider,
+        )
 
         planner.home()
         last_command = config.home.copy()

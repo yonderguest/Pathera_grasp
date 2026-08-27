@@ -3,7 +3,13 @@
 __version__ = "1.0.0"
 __author__ = "HighTorque Robotics"
 
-__all__ = ["Panthera", "GraspConfig", "GraspPlanner", "VisionStreamer"]
+__all__ = [
+    "Panthera",
+    "GraspConfig",
+    "GraspPlanner",
+    "VisionStreamer",
+    "GraspNetCandidateProvider",
+]
 
 
 def __getattr__(name):
@@ -23,4 +29,8 @@ def __getattr__(name):
         from .vision_streamer import VisionStreamer
 
         return VisionStreamer
+    if name == "GraspNetCandidateProvider":
+        from .graspnet_pipeline import GraspNetCandidateProvider
+
+        return GraspNetCandidateProvider
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
