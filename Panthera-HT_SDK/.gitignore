@@ -1,0 +1,9 @@
+# 构建目录
+build/
+*/build/
+
+# Python 缓存
+__pycache__/
+*.pyc
+
+*.claude
