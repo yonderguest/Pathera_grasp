@@ -81,6 +81,37 @@ class GraspPlanner:
             or np.max(np.abs(joints - seed)) > jump_limit
         ):
             return None
+
+        with self.sdk_call():
+            fk = self.robot.forward_kinematics(joints)
+        if fk is None:
+            return None
+        actual_position = np.asarray(fk["position"], dtype=float)
+        actual_rotation = np.asarray(fk["rotation"], dtype=float)
+        position_error = float(np.linalg.norm(actual_position - target_joint6))
+        rotation_error = float(
+            np.degrees(
+                np.arccos(
+                    np.clip(
+                        (
+                            float(np.trace(actual_rotation.T @ tool_rotation)) - 1.0
+                        )
+                        / 2.0,
+                        -1.0,
+                        1.0,
+                    )
+                )
+            )
+        )
+        if (
+            position_error > self.config.ik_position_tolerance_m
+            or rotation_error > self.config.ik_rotation_tolerance_deg
+        ):
+            print(
+                "[IK] rejected inaccurate solution: "
+                f"pos_err={position_error:.4f} m, rot_err={rotation_error:.2f} deg"
+            )
+            return None
         return joints
 
     def plan_grasp(self, joint6_target, tool_rotation):

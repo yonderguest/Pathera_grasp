@@ -93,7 +93,7 @@ class GraspConfig:
     home_velocity: list[float] = field(default_factory=lambda: [0.4] * 6)
 
     tcp_in_joint6: np.ndarray = field(
-        default_factory=lambda: np.array([0.14, 0.0, 0.0], dtype=float)
+        default_factory=lambda: np.array([0.165, 0.0, 0.0], dtype=float)
     )
     manual_grasp_rotation: np.ndarray = field(
         default_factory=lambda: np.array(
@@ -115,6 +115,8 @@ class GraspConfig:
     direct_grasp_duration: float = 5.0
     direct_grasp_post_command_wait: float = 1.0
     direct_grasp_settle_timeout: float = 2.0
+    ik_position_tolerance_m: float = 0.015
+    ik_rotation_tolerance_deg: float = 3.0
     return_home_duration: float = 5.0
     put1_duration: float = 5.0
     put2_duration: float = 5.0

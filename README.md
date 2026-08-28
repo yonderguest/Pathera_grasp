@@ -375,13 +375,22 @@ export GRASPNET_CHECKPOINT_PATH=/path/to/checkpoint-rs.tar
 
 > GraspNet 的夹爪坐标系可能与 Panthera 末端坐标系不完全一致。应先离线可视化候选位姿，调整 `graspnet_gripper_fix_rotation`，再上真机低速验证。
 
-机械臂末端工具偏移已经与官方 C++ SDK 对齐：
+机械臂末端工具偏移以 URDF 中 `tool_link` 到 `joint6` 的固定偏移为准：
 
 ```text
-tcp_in_joint6 = [0.14, 0.0, 0.0]
+tcp_in_joint6 = [0.165, 0.0, 0.0]
 ```
 
-官方 `Panthera.cpp` 中 `tool_offset_` 为 `0.14 m`，因此 Python 抓取配置也使用该值。
+官方 C++ `Panthera.cpp` 中硬编码的 `tool_offset_ = 0.14 m` 与 URDF 不一致；本项目沿用原 OBB 抓取路径验证过的 URDF 值 `0.165 m`。
+
+逆解结果现在会增加正运动学误差校验：
+
+```text
+ik_position_tolerance_m = 0.015
+ik_rotation_tolerance_deg = 3.0
+```
+
+位置误差或姿态误差超限的 IK 解会被丢弃，避免使用局部错误解。
 
 `pathera_grasp` 是当前板端专用 Conda 环境，已经包含：
 
