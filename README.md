@@ -339,6 +339,7 @@ GraspNet 路径在最终抓取前会先移动到一个预抓取点，再进入�
 
 ```text
 graspnet_pre_grasp_offset = 0.05
+graspnet_z_offset_m = -0.20
 ```
 
 ### checkpoint

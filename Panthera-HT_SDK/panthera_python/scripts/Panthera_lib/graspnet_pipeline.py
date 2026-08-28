@@ -288,10 +288,16 @@ class GraspNetCandidateProvider:
             tool_rotation = base_from_camera[:3, :3] @ tool_rotation_camera @ fix_rotation
             tool_target_camera = np.asarray(grasp.translation, dtype=float)
             tool_target = (base_from_camera @ np.append(tool_target_camera, 1.0))[:3]
+            tool_target = tool_target + np.array(
+                [0.0, 0.0, self.config.graspnet_z_offset_m],
+                dtype=float,
+            )
 
             if target_base_point is not None:
                 distance = float(
-                    np.linalg.norm(tool_target - np.asarray(target_base_point))
+                    np.linalg.norm(
+                        (tool_target - np.asarray(target_base_point))[:2]
+                    )
                 )
                 if distance > self.config.graspnet_target_radius_m:
                     continue

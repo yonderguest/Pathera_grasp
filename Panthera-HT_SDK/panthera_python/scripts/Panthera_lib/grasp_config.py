@@ -55,6 +55,7 @@ class GraspConfig:
     )
     graspnet_pre_grasp_offset: float = 0.05
     graspnet_lift_distance: float = 0.08
+    graspnet_z_offset_m: float = -0.20
     graspnet_manipulability_min: float = 0.0
     graspnet_max_joint_jump: float = 2.6
     graspnet_scene_expand_px: int = 80
