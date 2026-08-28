@@ -238,12 +238,49 @@ class GraspPlanner:
         )
         return False
 
-    def grasp_and_close(self, final, streamer=None):
+    def plan_graspnet_pre_grasp(self, found):
+        """Plan an approach waypoint just before the GraspNet grasp pose."""
+        cfg = self.config
+        tool_target = np.asarray(found["tool_target"], dtype=float)
+        tool_rotation = np.asarray(found["tool_rotation"], dtype=float)
+        approach = tool_rotation[:, 0]
+        pre_tool_target = tool_target - cfg.graspnet_pre_grasp_offset * approach
+        tcp_offset = tool_rotation @ cfg.tcp_in_joint6
+        pre_joint6_target = pre_tool_target - tcp_offset
+        seed = found.get("provisional_joints", cfg.manual_grasp_ik_seed)
+        return self.solve_ik(
+            pre_joint6_target,
+            tool_rotation,
+            np.asarray(seed, dtype=float),
+            cfg.graspnet_max_joint_jump,
+        )
+
+    def grasp_and_close(self, final, streamer=None, pre_grasp_joints=None):
         cfg = self.config
         print("[GRASP] opening gripper before direct grasp ...")
         self.open_gripper()
         if self.interrupted.is_set():
             return False, float("nan"), float("nan")
+
+        if pre_grasp_joints is not None:
+            pre_grasp_joints = np.asarray(pre_grasp_joints, dtype=float)
+            print("[GRASP] moving to pre-grasp waypoint ...")
+            self.move_j(
+                pre_grasp_joints,
+                cfg.direct_grasp_duration,
+                "PRE GRASP",
+                wait=False,
+            )
+            if not self.sleep_interruptible(
+                cfg.direct_grasp_duration + cfg.direct_grasp_post_command_wait
+            ):
+                return False, float("nan"), float("nan")
+            self.settle_at_grasp(
+                pre_grasp_joints,
+                duration=cfg.direct_grasp_settle_timeout,
+                pos_tol=0.015,
+                vel_tol=0.2,
+            )
 
         print("[GRASP] moving directly HOME -> grasp pose ...")
         self.move_j(final, cfg.direct_grasp_duration, "DIRECT GRASP", wait=False)
@@ -385,6 +422,7 @@ class GraspPlanner:
                 "use_graspnet is enabled but no GraspNetCandidateProvider was passed"
             )
 
+        current_joints = self.current_joint_position()
         for detection in matches:
             _camera_point, target_base_point = object_base_position(
                 detection, intrinsic, base_camera
@@ -408,7 +446,7 @@ class GraspPlanner:
                 provisional = self.solve_ik(
                     joint6_target,
                     tool_rotation,
-                    cfg.manual_grasp_ik_seed,
+                    current_joints,
                     cfg.graspnet_max_joint_jump,
                 )
                 if provisional is None:
@@ -434,6 +472,7 @@ class GraspPlanner:
                     "joint6_target": joint6_target,
                     "tool_rotation": tool_rotation,
                     "tool_target": tool_target,
+                    "provisional_joints": provisional,
                     "scan_joint1": joint1,
                     "scan_joint_position": scan_joint_position,
                     "score": candidate["score"],
@@ -683,12 +722,26 @@ class GraspPlanner:
                         return False
 
                 print("[SCAN] valid target found; checking direct scan-pose IK ...")
-                final = self.plan_grasp(
-                    found["joint6_target"], found["tool_rotation"]
-                )
+                if cfg.use_graspnet and "provisional_joints" in found:
+                    final = np.asarray(found["provisional_joints"], dtype=float)
+                    print("[PLAN] reusing the GraspNet-candidate IK solution.")
+                else:
+                    final = self.plan_grasp(
+                        found["joint6_target"], found["tool_rotation"]
+                    )
                 print("[PLAN] direct scan-pose grasp IK verified; auto grasp starts now.")
 
-                clamped, gpos, gtor = self.grasp_and_close(final, streamer=streamer)
+                pre_grasp_joints = None
+                if cfg.use_graspnet and "tool_target" in found:
+                    pre_grasp_joints = self.plan_graspnet_pre_grasp(found)
+                    if pre_grasp_joints is None:
+                        print("[GRASP] pre-grasp IK failed; using direct grasp only.")
+
+                clamped, gpos, gtor = self.grasp_and_close(
+                    final,
+                    streamer=streamer,
+                    pre_grasp_joints=pre_grasp_joints,
+                )
                 if not clamped:
                     print("[GRASP] clamp failed; releasing and returning HOME.")
                     self.open_gripper()

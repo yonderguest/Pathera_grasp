@@ -286,6 +286,12 @@ graspnet_approach_max_angle_deg = 35.0
 
 这样可以减少模型预测出大量侧向抓取的情况。
 
+GraspNet 路径在最终抓取前会先移动到一个预抓取点，再进入抓取点，避免从扫描位姿直接长距离冲向目标：
+
+```text
+graspnet_pre_grasp_offset = 0.05
+```
+
 ### checkpoint
 
 官方 RealSense checkpoint 已放入：
