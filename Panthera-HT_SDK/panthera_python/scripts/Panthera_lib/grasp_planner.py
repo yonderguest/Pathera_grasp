@@ -443,12 +443,16 @@ class GraspPlanner:
                 if not workspace_ok(tool_target, joint6_target, cfg):
                     continue
 
-                provisional = self.solve_ik(
-                    joint6_target,
-                    tool_rotation,
-                    current_joints,
-                    cfg.graspnet_max_joint_jump,
-                )
+                provisional = None
+                for seed in (current_joints, cfg.manual_grasp_ik_seed):
+                    provisional = self.solve_ik(
+                        joint6_target,
+                        tool_rotation,
+                        np.asarray(seed, dtype=float),
+                        cfg.graspnet_max_joint_jump,
+                    )
+                    if provisional is not None:
+                        break
                 if provisional is None:
                     print(
                         f"[{label}] J1={joint1:+.2f}: "
