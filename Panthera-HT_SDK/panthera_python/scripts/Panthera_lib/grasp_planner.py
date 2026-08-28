@@ -471,8 +471,6 @@ class GraspPlanner:
                 joint6_target = np.asarray(candidate["joint6_target"], dtype=float)
                 tool_rotation = np.asarray(candidate["tool_rotation"], dtype=float)
                 tool_target = np.asarray(candidate["tool_target"], dtype=float)
-                if not workspace_ok(tool_target, joint6_target, cfg):
-                    continue
 
                 provisional = None
                 for seed in (current_joints, cfg.manual_grasp_ik_seed):

@@ -330,7 +330,7 @@ GraspNet 现在不会只拿目标 mask 推理，而是使用目标框外扩后�
 ```text
 graspnet_scene_expand_px = 80
 graspnet_target_radius_m = 0.12
-graspnet_approach_max_angle_deg = 35.0
+graspnet_approach_max_angle_deg = 80.0
 ```
 
 这样可以减少模型预测出大量侧向抓取的情况。
