@@ -93,7 +93,7 @@ class GraspConfig:
     home_velocity: list[float] = field(default_factory=lambda: [0.4] * 6)
 
     tcp_in_joint6: np.ndarray = field(
-        default_factory=lambda: np.array([0.165, 0.0, 0.0], dtype=float)
+        default_factory=lambda: np.array([0.14, 0.0, 0.0], dtype=float)
     )
     manual_grasp_rotation: np.ndarray = field(
         default_factory=lambda: np.array(

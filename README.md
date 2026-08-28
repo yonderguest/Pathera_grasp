@@ -4,6 +4,55 @@
 
 **语言输入 → 相机识别 → 机械臂抓取 → 放置 → 安全回零**
 
+## 分层架构（层级关系）
+
+项目按「大脑 → 感知工具集（Tools）→ 小脑层（运动控制器）→ 输出层」分层：
+
+```mermaid
+flowchart TD
+    subgraph BRAIN["大脑：任务规划 + 交互"]
+        DEMO["grasp_demo.py<br/>入口 / 语言输入"]
+        PLANNER["grasp_planner.py<br/>高层规划 / 执行 / 安全停机"]
+    end
+    subgraph TOOLS["感知工具集（Tools）"]
+        VISION["vision_pipeline.py<br/>相机 / 检测 / 位姿计算"]
+        NPU["npu_inference.py<br/>QNN HTP YOLOE"]
+        GN["graspnet_pipeline.py<br/>GraspNet 候选生成"]
+        STREAM["vision_streamer.py<br/>网页 MJPEG 推流"]
+    end
+    subgraph CERE["小脑层（运动控制器）"]
+        PANTHERA["Panthera.py<br/>电机 / 关节 / 夹爪 / FK·IK / 轨迹"]
+    end
+    subgraph OUT["输出层"]
+        ARM["机械臂动作"]
+        WEB["网页推流"]
+    end
+
+    DEMO --> PLANNER
+    PLANNER --> PANTHERA
+    PANTHERA -->|"① 执行状态 / 故障 / 位姿反馈"| PLANNER
+    NPU --> VISION
+    GN --> VISION
+    VISION -->|"② 检测结果 / 目标坐标"| PLANNER
+    STREAM --> WEB
+    PANTHERA --> ARM
+```
+
+| 层 | 模块 | 职责 |
+|---|---|---|
+| 大脑 | `grasp_demo.py` + `grasp_planner.py` | 语言/终端输入、任务编排、抓取决策、重试与安全停机 |
+| 感知工具集（Tools） | `vision_pipeline.py` + `npu_inference.py` + `graspnet_pipeline.py` + `vision_streamer.py` | 相机采集、检测、位姿计算、候选生成、网页推流，不做运动控制 |
+| 小脑层（运动控制器） | `Panthera.py` | 电机驱动、关节/夹爪控制、FK/IK、轨迹规划与底层反馈 |
+| 输出层 | 机械臂动作 + 网页推流 | 对外交付的能力 |
+
+`grasp_config.py` 跨层共享，集中管理抓取、运动与视觉参数。
+
+关键数据流：
+
+- ① 小脑 → 大脑：执行状态、故障、位姿信息回传给 `grasp_planner.py`，用于判断抓取成败与重试；
+- ② 感知 → 大脑：检测结果与目标坐标回传给 `grasp_planner.py`；
+- 当前大脑是确定性规划（`grasp_planner.py`）；后续可在大脑层接入本地大模型（Qwen）做语义理解，下方小脑层与感知层接口保持不变。
+
 ## 工作流
 
 1. 启动后先让机械臂回到 `HOME` 并打开夹爪。
@@ -326,6 +375,14 @@ export GRASPNET_CHECKPOINT_PATH=/path/to/checkpoint-rs.tar
 
 > GraspNet 的夹爪坐标系可能与 Panthera 末端坐标系不完全一致。应先离线可视化候选位姿，调整 `graspnet_gripper_fix_rotation`，再上真机低速验证。
 
+机械臂末端工具偏移已经与官方 C++ SDK 对齐：
+
+```text
+tcp_in_joint6 = [0.14, 0.0, 0.0]
+```
+
+官方 `Panthera.cpp` 中 `tool_offset_` 为 `0.14 m`，因此 Python 抓取配置也使用该值。
+
 `pathera_grasp` 是当前板端专用 Conda 环境，已经包含：
 
 - 机械臂：`hightorque_robot`、`pinocchio`、`scipy`、`numpy<2`
@@ -336,11 +393,9 @@ export GRASPNET_CHECKPOINT_PATH=/path/to/checkpoint-rs.tar
 
 ## 设计原则
 
-代码按职责拆成四个模块，保持 **高内聚、低耦合**：
+代码按「大脑 / 感知工具集 / 小脑层」分层，保持 **高内聚、低耦合**：
 
-- `Panthera.py` 只负责机械臂底层能力。
-- `vision_pipeline.py` 只负责视觉和几何计算。
-- `npu_inference.py` 只负责 QNN HTP 检测器封装。
-- `graspnet_pipeline.py` 只负责 GraspNet 候选生成和坐标转换。
-- `grasp_planner.py` 只负责抓取任务编排。
-- `grasp_demo.py` 只负责入口和用户交互。
+- 大脑：`grasp_planner.py` 只负责抓取任务编排，`grasp_demo.py` 只负责入口和用户交互；
+- 感知工具集（Tools）：`vision_pipeline.py` 只负责视觉与几何计算，`npu_inference.py` 只负责 QNN HTP 检测器封装，`graspnet_pipeline.py` 只负责 GraspNet 候选生成与坐标转换，`vision_streamer.py` 只负责网页推流；
+- 小脑层（运动控制器）：`Panthera.py` 只负责机械臂底层能力；
+- `grasp_config.py` 集中管理抓取、运动与视觉参数。
