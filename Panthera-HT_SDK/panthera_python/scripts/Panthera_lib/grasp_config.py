@@ -23,6 +23,7 @@ class GraspConfig:
     stream_jpeg_quality: int = 85
     camera_detection_interval: float = 0.25
     camera_detection_timeout: float = 3.0
+    central_x_grasp_ratio: float = 0.60
 
     # Qualcomm QNN HTP NPU detector.  Disabled by default so the CPU YOLOE
     # path remains the safe fallback.

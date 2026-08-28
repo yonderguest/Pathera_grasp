@@ -355,6 +355,18 @@ class GraspPlanner:
         pose[0] = float(joint1)
         return pose
 
+    def _is_central_horizontal(self, detection):
+        cfg = self.config
+        ratio = float(np.clip(cfg.central_x_grasp_ratio, 0.0, 1.0))
+        if ratio <= 0.0:
+            return True
+        x1, _y1, x2, _y2 = detection["bbox"]
+        center_x = 0.5 * (float(x1) + float(x2))
+        margin = (1.0 - ratio) / 2.0
+        left = margin * cfg.width
+        right = (1.0 - margin) * cfg.width
+        return left <= center_x <= right
+
     def _select_graspnet_candidate(
         self,
         camera_feed,
@@ -460,6 +472,21 @@ class GraspPlanner:
         if not matches:
             print(f"[{label}] J1={joint1:+.2f}: no {color_label} block.")
             return None
+
+        central_matches = [
+            detection for detection in matches
+            if self._is_central_horizontal(detection)
+        ]
+        if not central_matches:
+            for detection in matches:
+                x1, _y1, x2, _y2 = detection["bbox"]
+                print(
+                    f"[{label}] J1={joint1:+.2f}: {color_label} block at "
+                    f"x_center={0.5 * (x1 + x2):.1f} is outside central "
+                    f"{self.config.central_x_grasp_ratio:.0%} region."
+                )
+            return None
+        matches = central_matches
 
         scan_joint_position = self.current_joint_position()
         if cfg.use_graspnet:
