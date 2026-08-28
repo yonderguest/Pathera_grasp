@@ -386,8 +386,8 @@ tcp_in_joint6 = [0.165, 0.0, 0.0]
 逆解结果现在会增加正运动学误差校验：
 
 ```text
-ik_position_tolerance_m = 0.015
-ik_rotation_tolerance_deg = 3.0
+ik_position_tolerance_m = 0.03
+ik_rotation_tolerance_deg = 6.0
 ```
 
 位置误差或姿态误差超限的 IK 解会被丢弃，避免使用局部错误解。

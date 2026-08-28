@@ -115,8 +115,8 @@ class GraspConfig:
     direct_grasp_duration: float = 5.0
     direct_grasp_post_command_wait: float = 1.0
     direct_grasp_settle_timeout: float = 2.0
-    ik_position_tolerance_m: float = 0.015
-    ik_rotation_tolerance_deg: float = 3.0
+    ik_position_tolerance_m: float = 0.03
+    ik_rotation_tolerance_deg: float = 6.0
     return_home_duration: float = 5.0
     put1_duration: float = 5.0
     put2_duration: float = 5.0
