@@ -56,6 +56,9 @@ class GraspConfig:
     graspnet_lift_distance: float = 0.08
     graspnet_manipulability_min: float = 0.0
     graspnet_max_joint_jump: float = 1.2
+    graspnet_scene_expand_px: int = 80
+    graspnet_target_radius_m: float = 0.12
+    graspnet_approach_max_angle_deg: float = 35.0
 
     width: int = 640
     height: int = 480

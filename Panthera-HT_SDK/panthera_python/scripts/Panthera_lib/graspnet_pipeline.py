@@ -101,6 +101,26 @@ def masked_point_cloud(
     return _downsample(points, colors, num_points)
 
 
+def _scene_mask_from_detection(depth_image, detection, config: GraspConfig):
+    """Build a local scene mask around a detection bbox.
+
+    GraspNet needs context (for example the table) around the object to
+    predict stable approach directions.  Feeding only the object mask makes the
+    model emit mostly side grasps.
+    """
+    depth = np.asanyarray(depth_image)
+    x1, y1, x2, y2 = [int(value) for value in detection["bbox"]]
+    expand = int(config.graspnet_scene_expand_px)
+    x1 = max(0, x1 - expand)
+    y1 = max(0, y1 - expand)
+    x2 = min(depth.shape[1], x2 + expand)
+    y2 = min(depth.shape[0], y2 + expand)
+
+    mask = np.zeros(depth.shape[:2], dtype=bool)
+    mask[y1:y2, x1:x2] = depth[y1:y2, x1:x2] > 0
+    return mask
+
+
 class GraspNetCandidateProvider:
     """Lazy loader around ``graspnet-baseline`` and ``graspnetAPI``."""
 
@@ -193,6 +213,7 @@ class GraspNetCandidateProvider:
         intrinsic,
         depth_scale: float,
         base_camera,
+        target_base_point=None,
     ) -> list[dict]:
         """Generate camera-frame candidates and convert them to base frame."""
         if not self.loaded:
@@ -200,10 +221,13 @@ class GraspNetCandidateProvider:
 
         import torch
 
+        scene_mask = _scene_mask_from_detection(
+            depth_image, detection, self.config
+        )
         points, colors = masked_point_cloud(
             color_image,
             depth_image,
-            detection["mask"],
+            scene_mask,
             intrinsic,
             depth_scale,
             self.config,
@@ -264,6 +288,30 @@ class GraspNetCandidateProvider:
             tool_rotation = base_from_camera[:3, :3] @ tool_rotation_camera @ fix_rotation
             tool_target_camera = np.asarray(grasp.translation, dtype=float)
             tool_target = (base_from_camera @ np.append(tool_target_camera, 1.0))[:3]
+
+            if target_base_point is not None:
+                distance = float(
+                    np.linalg.norm(tool_target - np.asarray(target_base_point))
+                )
+                if distance > self.config.graspnet_target_radius_m:
+                    continue
+
+            approach = tool_rotation[:, 0]
+            manual_approach = self.config.manual_grasp_rotation[:, 0]
+            approach_angle = float(
+                np.degrees(
+                    np.arccos(
+                        np.clip(
+                            abs(float(np.dot(approach, manual_approach))),
+                            -1.0,
+                            1.0,
+                        )
+                    )
+                )
+            )
+            if approach_angle > self.config.graspnet_approach_max_angle_deg:
+                continue
+
             tcp_offset = tool_rotation @ self.config.tcp_in_joint6
             joint6_target = tool_target - tcp_offset
 

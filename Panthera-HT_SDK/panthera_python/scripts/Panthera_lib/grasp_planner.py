@@ -374,6 +374,9 @@ class GraspPlanner:
             )
 
         for detection in matches:
+            _camera_point, target_base_point = object_base_position(
+                detection, intrinsic, base_camera
+            )
             candidates = self.graspnet_provider.generate_candidates(
                 capture["color_image"],
                 capture["depth_image"],
@@ -381,6 +384,7 @@ class GraspPlanner:
                 intrinsic,
                 camera_feed.depth_scale,
                 base_camera,
+                target_base_point=target_base_point,
             )
             for candidate in candidates:
                 joint6_target = np.asarray(candidate["joint6_target"], dtype=float)

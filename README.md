@@ -276,6 +276,16 @@ graspnet_num_point = 1024
 
 如果实际抓取中发现 1024 点导致候选质量不足，可以再逐步提高到 `2048`。
 
+GraspNet 现在不会只拿目标 mask 推理，而是使用目标框外扩后的局部场景点云，保留桌面等上下文，然后按目标位置和接近方向过滤候选：
+
+```text
+graspnet_scene_expand_px = 80
+graspnet_target_radius_m = 0.12
+graspnet_approach_max_angle_deg = 35.0
+```
+
+这样可以减少模型预测出大量侧向抓取的情况。
+
 ### checkpoint
 
 官方 RealSense checkpoint 已放入：
