@@ -1,0 +1,7 @@
+# IQ-9075 语音识别组件依赖（精简，仅识别所需）
+# 安装: pip install -r requirements.txt
+numpy>=1.24.0
+soundfile>=0.12.0
+sherpa-onnx>=1.10.0
+# 可选：麦克风录音（或使用系统 arecord）
+sounddevice>=0.4.6

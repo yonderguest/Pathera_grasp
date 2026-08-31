@@ -33,7 +33,10 @@ if str(SDK_ROOT) not in sys.path:
     sys.path.insert(0, str(SDK_ROOT))
 if str(SDK_SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SDK_SCRIPTS))
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
+from voice_controller import VoiceInterface  # noqa: E402
 from Panthera_lib.grasp_config import GraspConfig, parse_target_command  # noqa: E402
 from Panthera_lib.grasp_planner import GraspPlanner  # noqa: E402
 from Panthera_lib.vision_pipeline import (  # noqa: E402
@@ -70,10 +73,28 @@ signal.signal(signal.SIGINT, on_signal)
 signal.signal(signal.SIGTERM, on_signal)
 
 
-def choose_target_at_start():
+def choose_target_at_start(voice=None):
     safe_print(
         "\n您想要抓取什么？（例如：红色积木 / 黄色积木 / 蓝色积木，q 退出）"
     )
+    if voice is not None and voice.available:
+        voice.say("请说出要抓取的颜色，例如红色积木")
+        command = voice.listen_for_command()
+        if command:
+            command = command.strip()
+            if command.lower() == "q":
+                return False
+            color, accepted = parse_target_command(command)
+            if accepted:
+                selected = color if color is not None else "任意颜色"
+                safe_print(
+                    f"[TARGET] 语音识别：已选择 {selected} 积木；检测到可抓取目标后自动执行一次抓取。"
+                )
+                voice.say(f"已选择{selected}积木")
+                return color
+            safe_print(
+                f"[VOICE] 未能从语音识别颜色：{command!r}，请继续用终端输入。"
+            )
     while not shutdown_requested.is_set():
         try:
             command = input("> ")
@@ -88,6 +109,8 @@ def choose_target_at_start():
             safe_print(
                 f"[TARGET] 已选择 {selected} 积木；检测到可抓取目标后自动执行一次抓取。"
             )
+            if voice is not None:
+                voice.say(f"已选择{selected}积木")
             return color
         safe_print("未识别颜色，请输入红/黄/蓝/绿/白/黑积木，或 q 退出。")
     return False
@@ -101,7 +124,11 @@ def build_config():
     config.project_root = PROJECT_ROOT
     config.text_encoder_path = TEXT_ENCODER_PATH
     config.calibration_file = CALIBRATION_FILE
-    config.use_graspnet = os.environ.get("GRASPNET_USE", "0") == "1"
+    # OBB / Seeed is the default grasp backend. GraspNet is opt-in only
+    # when the operator explicitly sets GRASPNET_USE=1.
+    config.use_graspnet = False
+    if os.environ.get("GRASPNET_USE", "0") == "1":
+        config.use_graspnet = True
     config.use_npu = os.environ.get("YOLO_NPU", "0") == "1"
     config.graspnet_checkpoint_path = os.environ.get(
         "GRASPNET_CHECKPOINT_PATH", config.graspnet_checkpoint_path
@@ -110,6 +137,19 @@ def build_config():
     config.stream_port = int(os.environ.get("VISION_STREAM_PORT", "8080"))
     config.stream_jpeg_quality = int(
         os.environ.get("VISION_STREAM_JPEG_QUALITY", "85")
+    )
+    voice_input_flag = os.environ.get("VOICE_INPUT", "1").strip().lower()
+    config.use_voice = voice_input_flag not in {"0", "false", "no", "off"}
+    config.voice_asr_model_dir = os.environ.get(
+        "IQ9075_ASR_MODEL_DIR",
+        str(PROJECT_ROOT / "models" / "sensevoice"),
+    )
+    config.voice_tts_model_dir = os.environ.get(
+        "IQ9075_SHERPA_TTS_MODEL_DIR",
+        str(PROJECT_ROOT / "models" / "sherpa_tts" / "vits-melo-tts-zh_en"),
+    )
+    config.voice_prompt_duration = float(
+        os.environ.get("VOICE_PROMPT_DURATION", "3.5")
     )
     config.validate()
     return config
@@ -121,6 +161,7 @@ def main():
     streamer = None
     camera_feed = None
     npu_detector = None
+    voice = None
     config = build_config()
     last_command = config.zero.copy()
     try:
@@ -151,6 +192,18 @@ def main():
         safe_print("[VISION] camera preview started.")
 
         robot = Panthera(config.robot_config)
+        if config.use_voice:
+            voice = VoiceInterface(
+                config.project_root,
+                model_dir=config.voice_asr_model_dir,
+                tts_model_dir=config.voice_tts_model_dir,
+                prompt_duration=config.voice_prompt_duration,
+                enabled=True,
+            )
+            if voice.available:
+                safe_print("[VOICE] voice interface ready (offline ASR + TTS).")
+            else:
+                safe_print("[VOICE] voice interface unavailable; using terminal input.")
         graspnet_provider = None
         if config.use_graspnet:
             safe_print("[GRASPNET] loading GraspNet candidate provider ...")
@@ -162,6 +215,7 @@ def main():
             config,
             shutdown_requested,
             graspnet_provider=graspnet_provider,
+            voice=voice,
         )
 
         planner.home()
@@ -186,7 +240,7 @@ def main():
             intrinsic,
             tcp_camera,
             streamer,
-            choose_target_at_start,
+            lambda: choose_target_at_start(voice),
         )
         if task_complete:
             safe_print("[GRASP] scan, grasp and placement completed; returning to ZERO.")
@@ -208,6 +262,8 @@ def main():
                 pipeline.stop()
             except Exception:
                 pass
+        if voice is not None:
+            voice.close()
 
 
 if __name__ == "__main__":

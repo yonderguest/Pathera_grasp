@@ -21,6 +21,10 @@ class GraspConfig:
     stream_host: str = "0.0.0.0"
     stream_port: int = 8080
     stream_jpeg_quality: int = 85
+    use_voice: bool = True
+    voice_asr_model_dir: str = ""
+    voice_tts_model_dir: str = ""
+    voice_prompt_duration: float = 3.5
     camera_detection_interval: float = 0.25
     camera_detection_timeout: float = 3.0
     central_x_grasp_ratio: float = 0.60
@@ -34,8 +38,8 @@ class GraspConfig:
     npu_output_specs: str = "output_0:1,300,38;output_1:1,32,160,160"
     npu_confidence_threshold: float = 0.05
 
-    # GraspNet integration. Kept disabled by default so the existing OBB
-    # grasp path remains the safety fallback while GraspNet is evaluated.
+    # Default grasp backend is the OBB / Seeed geometric planner.
+    # GraspNet is opt-in only via the GRASPNET_USE environment switch.
     use_graspnet: bool = False
     graspnet_repo_path: str = "third_party/graspnet-baseline"
     graspnet_api_path: str = "third_party/graspnetAPI"

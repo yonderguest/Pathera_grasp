@@ -28,11 +28,18 @@ class GraspPlanner:
         config: GraspConfig,
         interrupt_event: threading.Event,
         graspnet_provider=None,
+        voice=None,
     ):
         self.robot = robot
         self.config = config
         self.interrupted = interrupt_event
         self.graspnet_provider = graspnet_provider
+        self.voice = voice
+
+    def _say(self, text: str) -> None:
+        """Speak a status message when a voice interface is available."""
+        if self.voice is not None:
+            self.voice.say(text)
 
     @contextlib.contextmanager
     def sdk_call(self):
@@ -156,6 +163,7 @@ class GraspPlanner:
             )
         if result is False:
             raise RuntimeError("HOME move failed")
+        self._say("机械臂已回到初始位置")
 
     def open_gripper(self):
         cfg = self.config
@@ -379,6 +387,7 @@ class GraspPlanner:
             self.open_gripper()
             return False, gpos, gtor
         print(f"[GRASP] gripper clamped: pos={gpos:+.3f}, torque={gtor:+.3f}")
+        self._say("已夹紧物体")
         if self.interrupted.is_set():
             self.open_gripper()
             return False, gpos, gtor
@@ -399,6 +408,7 @@ class GraspPlanner:
         self.open_gripper()
         if self.interrupted.is_set():
             return False
+        self._say("物体已放置")
         print(f"[PUT2] moving to PUT2 with gripper open: {np.round(cfg.put2, 3)}")
         self.move_j(cfg.put2, cfg.put2_duration, "PUT2")
         return True
@@ -501,6 +511,7 @@ class GraspPlanner:
                 print(f"Tool target     : {np.round(tool_target, 3)} m")
                 print(f"Joint6 target   : {np.round(joint6_target, 3)} m")
                 print("=" * 68)
+                self._say(f"发现{detection['color']}积木，准备抓取")
                 return {
                     "joint6_target": joint6_target,
                     "tool_rotation": tool_rotation,
@@ -628,6 +639,7 @@ class GraspPlanner:
             print(f"Jaw angle vs manual reference: {jaw_angle_deg:+.1f} deg")
             print(f"Tool target: {np.round(tool_target, 3)} m")
             print("=" * 68)
+            self._say(f"发现{detection['color']}积木，准备抓取")
             return {
                 "joint6_target": joint6_target,
                 "tool_rotation": tool_rotation,
@@ -652,6 +664,7 @@ class GraspPlanner:
             f"J1 {cfg.scan_j1_start:+.2f} -> {cfg.scan_j1_end:+.2f} rad, "
             f"step {cfg.scan_j1_step:.2f} rad."
         )
+        self._say(f"开始寻找{color_label}积木")
 
         start_pose = self.scan_pose(cfg.scan_j1_start)
         print(f"[SCAN] moving HOME -> scan start J1={cfg.scan_j1_start:+.2f} rad ...")
@@ -800,6 +813,7 @@ class GraspPlanner:
                     f"[GRASP] force below threshold; releasing. "
                     f"attempt={attempt}/{cfg.grasp_max_attempts}"
                 )
+                self._say("抓取力不足，重新尝试")
                 self.open_gripper()
                 if attempt >= cfg.grasp_max_attempts:
                     print(
@@ -866,6 +880,7 @@ class GraspPlanner:
     def safe_shutdown(self, pipeline, last_command):
         cfg = self.config
         print("\n[SHUTDOWN] stopping camera and returning to ZERO ...")
+        self._say("任务结束，机械臂回零")
         if pipeline is not None:
             try:
                 pipeline.stop()
