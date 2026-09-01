@@ -107,6 +107,7 @@ class CameraFeed:
         self._last_inference_start_time = 0.0
         self._last_error_time = 0.0
         self._fatal_error: Exception | None = None
+        self._pipeline_stopped = False
         self._performance_window_start = time.monotonic()
         self._performance_capture_count = 0
         self._performance_inference_count = 0
@@ -134,6 +135,15 @@ class CameraFeed:
 
     def stop(self, timeout: float = 2.0) -> None:
         self._stop_event.set()
+        # ``wait_for_frames`` can remain blocked while the device is active.
+        # Stop the RealSense pipeline first so the capture thread exits and the
+        # next process can acquire the camera immediately.
+        if not self._pipeline_stopped:
+            try:
+                self.pipeline.stop()
+            except Exception:
+                pass
+            self._pipeline_stopped = True
         for thread in (self._capture_thread, self._inference_thread):
             if thread is not None:
                 thread.join(timeout=timeout)
@@ -223,16 +233,12 @@ class CameraFeed:
                         "capture_timestamp_ns": capture_timestamp_ns,
                         "frame_seq": self._capture_sequence,
                     }
-                    detections = list(self._detections)
-
-                if self.streamer is not None:
-                    self.streamer.publish(
-                        color_image,
-                        detections,
-                        depth_image=depth_image,
-                        depth_scale=self.depth_scale,
-                    )
+                # Do not overlay detections from an older inference on this new
+                # capture. The inference thread publishes the coherent RGB-D +
+                # detections snapshot after processing the same frame.
             except Exception as exc:
+                if self._stop_event.is_set():
+                    break
                 self._report_error(exc)
                 time.sleep(0.05)
 
@@ -314,10 +320,18 @@ class CameraFeed:
             self._performance_inference_count = 0
             self._performance_window_start = now
         backend = "NPU" if self.npu_detector is not None else "CPU"
+        decode = ""
+        if self.npu_detector is not None:
+            stats = getattr(self.npu_detector, "last_decode_stats", {})
+            if stats:
+                decode = (
+                    f", npu_candidates={stats.get('above_threshold', 0)}"
+                    f"->{stats.get('after_nms', 0)}"
+                )
         print(
             f"[VISION-PERF] backend={backend}, capture={capture_count / elapsed:.1f} FPS, "
             f"detect={inference_count / elapsed:.2f} FPS, infer={latency * 1000.0:.0f} ms, "
-            f"objects={detection_count}",
+            f"objects={detection_count}{decode}",
             flush=True,
         )
 
@@ -328,14 +342,36 @@ class CameraFeed:
             print(f"[CAMERA-FEED] frame failed: {exc!r}", flush=True)
 
 
-def get_base_camera_transform(robot, tcp_camera, joint_position=None):
-    """Return Base<-Camera for an explicit, snapshot-bound joint position."""
+def get_base_camera_transform(
+    robot,
+    tcp_camera,
+    joint_position=None,
+    *,
+    tcp_in_joint6,
+):
+    """Return Base<-Camera for an explicit, snapshot-bound joint position.
+
+    The current project FK deliberately returns the ``joint6`` frame, while
+    the 831 hand-eye calibration was collected with the reference SDK whose FK
+    already included the 165 mm gripper-tip offset.  Therefore the saved
+    ``T_tcp_camera`` is Camera->TCP, not Camera->joint6.  Bridge that frame gap
+    explicitly before applying the hand-eye transform; otherwise the camera
+    point appears to jump when the wrist rotates at pre-grasp.
+    """
     fk = robot.forward_kinematics(joint_position)
     if fk is None:
         raise RuntimeError("forward_kinematics failed")
+    rotation = np.asarray(fk["rotation"], dtype=float)
+    joint6_position = np.asarray(fk["position"], dtype=float)
+    offset = np.asarray(tcp_in_joint6, dtype=float)
+    if rotation.shape != (3, 3) or joint6_position.shape != (3,):
+        raise RuntimeError("invalid forward-kinematics pose for camera transform")
+    if offset.shape != (3,) or not np.all(np.isfinite(offset)):
+        raise ValueError("tcp_in_joint6 must be a finite 3-vector")
+
     base_tcp = np.eye(4)
-    base_tcp[:3, :3] = np.asarray(fk["rotation"], dtype=float)
-    base_tcp[:3, 3] = np.asarray(fk["position"], dtype=float)
+    base_tcp[:3, :3] = rotation
+    base_tcp[:3, 3] = joint6_position + rotation @ offset
     return base_tcp @ tcp_camera
 
 
@@ -551,9 +587,10 @@ def median_mask_depth(depth_frame, mask, depth_scale, config: GraspConfig):
 def _detection_from_result(name, conf, bbox, mask, color_image, depth_frame, depth_scale, config):
     x1, y1, x2, y2 = bbox
     full_mask = (np.asarray(mask, dtype=np.float32) > 0.5).astype(np.uint8)
-    if full_mask.shape != (config.height, config.width):
+    image_height, image_width = np.asarray(color_image).shape[:2]
+    if full_mask.shape != (image_height, image_width):
         full_mask = cv2.resize(
-            full_mask, (config.width, config.height), interpolation=cv2.INTER_NEAREST
+            full_mask, (image_width, image_height), interpolation=cv2.INTER_NEAREST
         )
     color_evidence = extract_color_evidence(color_image, full_mask, config)
     color, color_confidence, color_samples, color_margin = classify_color_evidence(
@@ -636,6 +673,78 @@ def detect_targets(model, color_image, depth_frame, depth_scale, config: GraspCo
     return detections
 
 
+def detect_requested_color_regions(
+    color_image,
+    depth_frame,
+    depth_scale,
+    requested_color,
+    config: GraspConfig,
+):
+    """Conservative colour-region fallback used only during visual refinement.
+
+    It is not a replacement for YOLO. It may rescue one already-identified
+    coloured block when the detector misses a close/partially occluded frame.
+    Candidate identity is still checked in Base coordinates by the planner.
+    """
+    boundary = int(config.color_yellow_green_boundary)
+    hue_ranges = {
+        "red": ((0, 12), (168, 180)),
+        "yellow": ((12, boundary),),
+        "green": ((boundary, 85),),
+        "blue": ((85, 140),),
+    }
+    ranges = hue_ranges.get(requested_color)
+    if ranges is None:
+        return []
+
+    image = np.asarray(color_image, dtype=np.uint8)
+    height, width = image.shape[:2]
+    hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+    hue = hsv[:, :, 0]
+    valid = (
+        (hsv[:, :, 1] >= config.color_min_saturation)
+        & (hsv[:, :, 2] >= config.color_min_value)
+    )
+    hue_match = np.zeros((height, width), dtype=bool)
+    for lower, upper in ranges:
+        hue_match |= (hue >= lower) & (hue < upper)
+    mask = (valid & hue_match).astype(np.uint8)
+    mask = cv2.morphologyEx(
+        mask,
+        cv2.MORPH_OPEN,
+        np.ones((3, 3), dtype=np.uint8),
+    )
+
+    count, labels, stats, _centroids = cv2.connectedComponentsWithStats(mask, 8)
+    detections = []
+    for label in range(1, count):
+        area = int(stats[label, cv2.CC_STAT_AREA])
+        if not (
+            config.refine_fallback_min_area_px
+            <= area
+            <= config.refine_fallback_max_area_px
+        ):
+            continue
+        x = int(stats[label, cv2.CC_STAT_LEFT])
+        y = int(stats[label, cv2.CC_STAT_TOP])
+        box_w = int(stats[label, cv2.CC_STAT_WIDTH])
+        box_h = int(stats[label, cv2.CC_STAT_HEIGHT])
+        component = (labels == label).astype(np.uint8)
+        detection = _detection_from_result(
+            "colour-region fallback",
+            0.0,
+            (x, y, x + box_w, y + box_h),
+            component,
+            image,
+            depth_frame,
+            depth_scale,
+            config,
+        )
+        if detection is not None and detection["color"] == requested_color:
+            detections.append(detection)
+    return detections
+
+
 def detect_targets_npu(
     npu_detector,
     color_image,
@@ -649,7 +758,17 @@ def detect_targets_npu(
     raw_detections = npu_detector.infer(color_image)
     detections = []
     for raw in raw_detections:
+        if not {"box", "mask", "cls", "conf"}.issubset(raw):
+            continue
         x1, y1, x2, y2 = [int(value) for value in raw["box"]]
+        cls = int(raw["cls"])
+        confidence = float(raw["conf"])
+        if (
+            cls < 0
+            or cls >= len(npu_detector.names)
+            or not np.isfinite(confidence)
+        ):
+            continue
         crop = np.asarray(raw["mask"], dtype=np.float32)
         if crop.shape[:2] != (y2 - y1, x2 - x1):
             crop = cv2.resize(
@@ -661,13 +780,14 @@ def detect_targets_npu(
         y2 = max(0, min(y2, color_image.shape[0]))
         x1 = max(0, min(x1, color_image.shape[1] - 1))
         x2 = max(0, min(x2, color_image.shape[1]))
+        if x2 - x1 < 2 or y2 - y1 < 2:
+            continue
         full_mask[y1:y2, x1:x2] = crop[: y2 - y1, : x2 - x1]
 
-        cls = int(raw["cls"])
-        name = npu_detector.names[cls] if cls < len(npu_detector.names) else "object"
+        name = npu_detector.names[cls]
         detection = _detection_from_result(
             name,
-            float(raw["conf"]),
+            confidence,
             (x1, y1, x2, y2),
             full_mask,
             color_image,
@@ -823,7 +943,17 @@ def grasp_rotation_from_mask(detection, camera_point, intrinsic, base_camera, co
 
 
 def grasp_geometry(base_point, tool_rotation, config):
-    tool_target = np.asarray(base_point, dtype=float) + config.grasp_offset_base
+    tool_rotation = np.asarray(tool_rotation, dtype=float)
+    approach = np.asarray(tool_rotation[:, 0], dtype=float)
+    approach_norm = float(np.linalg.norm(approach))
+    if approach_norm < 1e-8:
+        raise ValueError("grasp approach direction has zero length")
+    approach /= approach_norm
+    tool_target = (
+        np.asarray(base_point, dtype=float)
+        + config.grasp_offset_base
+        + float(config.grasp_approach_overtravel_m) * approach
+    )
     tcp_offset = tool_rotation @ config.tcp_in_joint6
     joint6_target = tool_target - tcp_offset
     return tool_target, joint6_target

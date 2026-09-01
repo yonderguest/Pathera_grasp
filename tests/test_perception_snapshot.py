@@ -9,6 +9,7 @@ from Panthera_lib.vision_pipeline import (
     CameraFeed,
     classify_color,
     classify_color_evidence,
+    detect_requested_color_regions,
     robust_surface_point,
 )
 
@@ -24,6 +25,27 @@ def _capture(frame_seq: int, value: int) -> dict:
 
 
 class PerceptionSnapshotTests(unittest.TestCase):
+    def test_camera_feed_stop_releases_pipeline_before_join(self):
+        class Pipeline:
+            def __init__(self):
+                self.stopped = 0
+
+            def stop(self):
+                self.stopped += 1
+
+        pipeline = Pipeline()
+        feed = CameraFeed(
+            pipeline,
+            align=None,
+            config=GraspConfig(),
+            depth_scale=0.001,
+        )
+
+        feed.stop()
+        feed.stop()
+
+        self.assertEqual(pipeline.stopped, 1)
+
     def test_depth_uses_one_coherent_near_surface_for_pixel_and_z(self):
         config = GraspConfig()
         depth = np.full((20, 20), 550, dtype=np.uint16)
@@ -79,6 +101,24 @@ class PerceptionSnapshotTests(unittest.TestCase):
         self.assertEqual(ratio, 0.5)
         self.assertEqual(samples, 100)
         self.assertLess(margin, config.color_min_margin)
+
+    def test_refinement_color_fallback_recovers_known_green_block(self):
+        config = GraspConfig()
+        image = np.zeros((120, 160, 3), dtype=np.uint8)
+        image[35:85, 55:105] = [0, 220, 0]
+        depth = np.full((120, 160), 500, dtype=np.uint16)
+
+        detections = detect_requested_color_regions(
+            image,
+            depth,
+            0.001,
+            "green",
+            config,
+        )
+
+        self.assertEqual(len(detections), 1)
+        self.assertEqual(detections[0]["color"], "green")
+        self.assertAlmostEqual(detections[0]["depth_m"], 0.5, places=3)
 
     def test_snapshot_keeps_rgb_depth_and_detections_on_same_frame(self):
         feed = CameraFeed(None, None, GraspConfig(), 0.001, intrinsic="K")

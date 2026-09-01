@@ -28,14 +28,6 @@ import numpy as np
 from .grasp_config import GraspConfig
 
 
-BLOCK_NAMES = (
-    "toy building block",
-    "plastic building block",
-    "wooden block",
-    "Lego brick",
-)
-
-
 class NpuYoloDetector:
     """Persistent QNN HTP YOLOE detector for four generic block prompts."""
 
@@ -51,9 +43,10 @@ class NpuYoloDetector:
         self.iou_threshold = float(config.npu_iou_threshold)
         self.pre_nms_top_k = int(config.npu_pre_nms_top_k)
         self.max_detections = int(config.npu_max_detections)
-        self.names = BLOCK_NAMES
+        self.names = tuple(config.npu_class_names)
         self.response_timeout = float(config.npu_response_timeout)
         self._io_lock = threading.Lock()
+        self.last_decode_stats: dict[str, int] = {}
 
         self.fifo = f"/tmp/npu_resp_{os.getpid()}.fifo"
         try:
@@ -231,26 +224,64 @@ class NpuYoloDetector:
         proto = np.frombuffer(outs[1], dtype=np.float32).reshape(32, 160, 160)
         boxes = pred[:, 0:4]
         confidence = pred[:, 4]
-        labels = pred[:, 5].astype(int)
+        raw_labels = pred[:, 5]
+        labels = np.full(raw_labels.shape, -1, dtype=int)
+        finite_labels = np.isfinite(raw_labels)
+        labels[finite_labels] = np.rint(raw_labels[finite_labels]).astype(int)
         coeffs = pred[:, 6:38]
 
-        eligible = np.where(confidence >= self.confidence)[0]
+        finite = np.all(np.isfinite(pred), axis=1)
+        valid_label = (
+            finite_labels
+            & (np.abs(raw_labels - labels) <= 1e-3)
+            & (labels >= 0)
+            & (labels < len(self.names))
+        )
+        valid_source_box = (
+            (boxes[:, 2] - boxes[:, 0] >= 2.0)
+            & (boxes[:, 3] - boxes[:, 1] >= 2.0)
+        )
+        mapped_boxes = np.column_stack(
+            (
+                np.clip((boxes[:, 0] - dx) / ratio, 0.0, float(width)),
+                np.clip((boxes[:, 1] - dy) / ratio, 0.0, float(height)),
+                np.clip((boxes[:, 2] - dx) / ratio, 0.0, float(width)),
+                np.clip((boxes[:, 3] - dy) / ratio, 0.0, float(height)),
+            )
+        )
+        valid_mapped_box = (
+            (mapped_boxes[:, 2] - mapped_boxes[:, 0] >= 2.0)
+            & (mapped_boxes[:, 3] - mapped_boxes[:, 1] >= 2.0)
+        )
+        valid_box = valid_source_box & valid_mapped_box
+        eligible = np.where(
+            finite
+            & valid_label
+            & valid_box
+            & (confidence >= self.confidence)
+        )[0]
         selected = self._nms_indices(
-            boxes[eligible],
+            mapped_boxes[eligible],
             confidence[eligible],
             self.iou_threshold,
             self.pre_nms_top_k,
             self.max_detections,
         )
+        self.last_decode_stats = {
+            "raw": int(pred.shape[0]),
+            "invalid_nonfinite": int(np.count_nonzero(~finite)),
+            "invalid_label": int(np.count_nonzero(finite & ~valid_label)),
+            "invalid_box": int(np.count_nonzero(finite & valid_label & ~valid_box)),
+            "above_threshold": int(eligible.size),
+            "after_nms": int(len(selected)),
+        }
         detections: list[dict] = []
         for relative_index in selected:
             index = int(eligible[relative_index])
-            x1 = max(0.0, (boxes[index, 0] - dx) / ratio)
-            y1 = max(0.0, (boxes[index, 1] - dy) / ratio)
-            x2 = min(float(width), (boxes[index, 2] - dx) / ratio)
-            y2 = min(float(height), (boxes[index, 3] - dy) / ratio)
+            x1, y1, x2, y2 = mapped_boxes[index]
 
-            raw_mask = 1.0 / (1.0 + np.exp(-(coeffs[index] @ proto.reshape(32, -1))))
+            mask_logits = coeffs[index] @ proto.reshape(32, -1)
+            raw_mask = 1.0 / (1.0 + np.exp(-np.clip(mask_logits, -60.0, 60.0)))
             raw_mask = raw_mask.reshape(160, 160)
             raw_mask = cv2.resize(
                 raw_mask, (self.input_size, self.input_size),

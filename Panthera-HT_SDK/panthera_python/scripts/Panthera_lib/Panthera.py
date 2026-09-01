@@ -252,6 +252,14 @@ class Panthera(htr.Robot):  # 继承自htr.Robot
             state.append(motor_state)
         return state
 
+    def refresh_motor_state(self, settle_time=0.02):
+        """主动刷新电机反馈，避免稳定判定读取运动过程中的缓存值。"""
+        self.send_get_motor_state_cmd()
+        self.motor_send_cmd()
+        if settle_time > 0.0:
+            time.sleep(float(settle_time))
+        return self.get_current_state()
+
     def get_current_pos(self):
         """获取当前关节角度，返回np.ndarray"""
         joint_angles = np.zeros(self.motor_count)
@@ -1683,14 +1691,24 @@ class Panthera(htr.Robot):  # 继承自htr.Robot
         state = gripper_motor.get_current_motor_state()
         return float(state.position), float(state.torque)
 
-    def move_j_checked(self, joints, duration, max_torque, label="moveJ", wait=True):
+    def move_j_checked(
+        self,
+        joints,
+        duration,
+        max_torque,
+        label="moveJ",
+        wait=True,
+        timeout=15.0,
+        tolerance=0.05,
+    ):
         """发送 moveJ 并在被拒绝时抛出异常。"""
         result = self.moveJ(
             joints,
             duration=duration,
             max_tqu=max_torque,
             iswait=wait,
-            tolerance=0.05,
+            tolerance=float(tolerance),
+            timeout=float(timeout),
         )
         if result is False:
             reason = "rejected or timed out" if wait else "rejected"

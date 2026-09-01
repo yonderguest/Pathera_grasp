@@ -197,31 +197,36 @@ _LEGACY_INDEX_HTML = """<!doctype html>
 _INDEX_HTML = """<!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Panthera 积木抓取</title>
+<title>Panthera 抓取</title>
 <style>
 :root{color-scheme:dark;--bg:#0b1220;--card:#111c2e;--line:#26354d;--text:#edf4ff;--muted:#9eb0c8;--blue:#3b82f6;--red:#dc3545}
 *{box-sizing:border-box}body{margin:0;background:linear-gradient(145deg,#08101d,#111c2e);color:var(--text);font-family:"Segoe UI","Microsoft YaHei",sans-serif}
 .shell{width:min(1480px,100%);margin:auto;padding:18px}header{display:flex;justify-content:space-between;align-items:center;gap:12px;margin-bottom:14px}h1{margin:0;font-size:clamp(21px,3vw,30px)}
 .badge{padding:7px 11px;border:1px solid #2d4b70;border-radius:999px;color:#9bd3ff;background:#10233c;font-size:13px}.card{background:#111c2ef5;border:1px solid var(--line);border-radius:14px;box-shadow:0 12px 35px #0005;overflow:hidden}
-.video-grid{display:grid;grid-template-columns:1fr 1fr;gap:14px}.video h2{margin:0;padding:10px 14px;font-size:16px;border-bottom:1px solid var(--line)}.video img{display:block;width:100%;aspect-ratio:4/3;object-fit:contain;background:#03070d}.controls{margin-top:14px;padding:16px}.controls h2{margin:0 0 12px;font-size:17px}.row{display:grid;grid-template-columns:180px 1fr auto;gap:10px}
+.vision-stage{display:grid;grid-template-columns:68px minmax(0,1fr) 68px;gap:12px;align-items:center}.video-grid{display:grid;grid-template-columns:1fr 1fr;gap:14px}.video h2{margin:0;padding:10px 14px;font-size:16px;border-bottom:1px solid var(--line)}.video img{display:block;width:100%;aspect-ratio:4/3;object-fit:contain;background:#03070d}.controls{margin-top:14px;padding:16px}.controls h2{margin:0 0 12px;font-size:17px}.row{display:grid;grid-template-columns:180px 1fr auto;gap:10px}
 select,input,button{min-height:43px;border-radius:9px;border:1px solid #3a4b64;padding:0 12px;font:inherit}select,input{color:var(--text);background:#0b1525}button{color:white;border:0;font-weight:700;cursor:pointer}button:disabled{opacity:.45;cursor:not-allowed}#send-target{background:var(--blue)}#stop-program{background:var(--red)}
-.actions{display:flex;gap:10px;margin-top:12px;align-items:center;justify-content:space-between;flex-wrap:wrap}.safety{color:#ffd580;font-size:14px}.safety input{min-height:auto;vertical-align:middle}#control-status{margin-top:12px;padding:11px 13px;border-radius:9px;background:#0b1525;color:#b9d9ff;min-height:43px}
-@media(max-width:900px){.video-grid{grid-template-columns:1fr}.row{grid-template-columns:1fr}.actions button{width:100%}header{align-items:flex-start;flex-direction:column}}
+.jog-button{height:96px;padding:0;border:1px solid #31547d;background:#102b4d;color:#d9ebff;font-size:40px;box-shadow:0 10px 25px #0004}.jog-button:hover:not(:disabled){background:#174574}.jog-button span{display:block;font-size:11px;font-weight:600;margin-top:-5px}.actions{display:flex;gap:10px;margin-top:12px;align-items:center;justify-content:flex-end;flex-wrap:wrap}#control-status{margin-top:12px;padding:11px 13px;border-radius:9px;background:#0b1525;color:#b9d9ff;min-height:43px}
+@media(max-width:900px){.vision-stage{grid-template-columns:48px minmax(0,1fr) 48px;gap:7px}.video-grid{grid-template-columns:1fr}.jog-button{height:76px;font-size:31px}.jog-button span{display:none}.row{grid-template-columns:1fr}.actions button{width:100%}header{align-items:flex-start;flex-direction:column}.shell{padding:10px}}
 </style></head><body><main class="shell">
-<header><h1>Panthera 积木抓取</h1><span class="badge">NPU 实时视觉</span></header>
+<header><h1>Panthera 抓取</h1><span class="badge">NPU 实时视觉</span></header>
+<section class="vision-stage">
+<button id="jog-left" class="jog-button" type="button" aria-label="一号关节向左转动零点五弧度" title="J1 向左 +0.5 rad">←<span>J1 左转 0.5 rad</span></button>
 <section class="video-grid">
 <div class="card video"><h2>深度画面</h2><img src="/stream/depth" alt="对齐深度画面"></div>
 <div class="card video"><h2>YOLO 识别</h2><img src="/stream/yolo" alt="积木识别画面"></div>
 </section>
+<button id="jog-right" class="jog-button" type="button" aria-label="一号关节向右转动零点五弧度" title="J1 向右 -0.5 rad">→<span>J1 右转 0.5 rad</span></button>
+</section>
 <section class="card controls"><h2>选择抓取目标</h2><div class="row">
 <select id="target-preset" aria-label="目标颜色"><option value="红色积木">红色积木</option><option value="黄色积木">黄色积木</option><option value="绿色积木">绿色积木</option><option value="蓝色积木">蓝色积木</option><option value="白色积木">白色积木</option><option value="黑色积木">黑色积木</option><option value="任意颜色">任意颜色</option></select>
 <input id="target-text" maxlength="64" placeholder="可选：直接输入目标，例如“抓绿色积木”"><button id="send-target" type="button">开始抓取</button></div>
-<div class="actions"><label class="safety"><input id="safety-confirm" type="checkbox"> 已确认机械臂路径内无人、无障碍物</label><button id="stop-program" type="button">结束程序并回启动姿态</button></div>
+<div class="actions"><button id="stop-program" type="button">结束程序并回启动姿态</button></div>
 <div id="control-status">正在连接程序状态…</div></section>
 </main><script>
-const statusNode=document.getElementById("control-status"),sendButton=document.getElementById("send-target"),stopButton=document.getElementById("stop-program");
-async function refreshStatus(){try{const r=await fetch("/api/status",{cache:"no-store"}),d=await r.json();statusNode.textContent=d.message||"等待目标";sendButton.disabled=!d.accepting_targets||d.stop_requested;stopButton.disabled=!!d.stop_requested}catch(_){statusNode.textContent="控制状态连接失败"}}
-sendButton.addEventListener("click",async()=>{if(!document.getElementById("safety-confirm").checked){statusNode.textContent="请先勾选现场安全确认";return}const typed=document.getElementById("target-text").value.trim(),command=typed||document.getElementById("target-preset").value;if(!confirm(`确认开始抓取“${command}”？`))return;try{const r=await fetch("/api/target",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({command,confirmed:true})}),d=await r.json();statusNode.textContent=d.message}catch(_){statusNode.textContent="目标提交失败"}});
+const statusNode=document.getElementById("control-status"),sendButton=document.getElementById("send-target"),stopButton=document.getElementById("stop-program"),jogButtons=[document.getElementById("jog-left"),document.getElementById("jog-right")];
+async function refreshStatus(){try{const r=await fetch("/api/status",{cache:"no-store"}),d=await r.json();statusNode.textContent=d.message||"等待目标";sendButton.disabled=!d.accepting_targets||d.jog_active||d.stop_requested;jogButtons.forEach(b=>b.disabled=!d.accepting_jog||d.stop_requested);stopButton.disabled=!!d.stop_requested}catch(_){statusNode.textContent="控制状态连接失败"}}
+sendButton.addEventListener("click",async()=>{const typed=document.getElementById("target-text").value.trim(),command=typed||document.getElementById("target-preset").value;if(!confirm(`确认开始抓取“${command}”？请确保机械臂路径内无人、无障碍物。`))return;try{const r=await fetch("/api/target",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({command,confirmed:true})}),d=await r.json();statusNode.textContent=d.message}catch(_){statusNode.textContent="目标提交失败"}});
+jogButtons.forEach(button=>button.addEventListener("click",async()=>{const direction=button.id==="jog-left"?"left":"right";jogButtons.forEach(b=>b.disabled=true);sendButton.disabled=true;try{const r=await fetch("/api/joint1",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({direction})}),d=await r.json();statusNode.textContent=d.message}catch(_){statusNode.textContent="一号关节转动请求失败"}}));
 stopButton.addEventListener("click",async()=>{if(!confirm("确认结束程序？机械臂将返回程序接管前的启动姿态，再停止电机。"))return;try{const r=await fetch("/api/stop",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({confirmed:true})}),d=await r.json();statusNode.textContent=d.message;stopButton.disabled=true;sendButton.disabled=true}catch(_){statusNode.textContent="结束请求发送失败"}});
 refreshStatus();setInterval(refreshStatus,1000);
 </script></body></html>
@@ -348,6 +353,8 @@ class VisionStreamer:
         self._selected_color: str | None = None
         self._has_selected_color = False
         self._pending_target_command: str | None = None
+        self._pending_joint1_jog: str | None = None
+        self._joint1_jog_active = False
         self._accepting_targets = False
         self._stop_requested = False
         self._control_message = "等待目标输入。"
@@ -410,6 +417,8 @@ class VisionStreamer:
                 raise RuntimeError("推流服务已经关闭")
             if not self._accepting_targets:
                 raise RuntimeError("主程序当前不在等待目标，未接受本次提交")
+            if self._joint1_jog_active:
+                raise RuntimeError("一号关节正在转动，请等待动作完成")
             self._pending_target_command = normalized
             self._control_message = f"已提交：{normalized}；等待主程序确认。"
             self._condition.notify_all()
@@ -423,12 +432,47 @@ class VisionStreamer:
                 self._control_message = f"主程序正在解析：{command}"
             return command
 
+    def submit_joint1_jog(self, direction: str) -> None:
+        """Queue one idle-state J1 jog for execution by the main robot thread."""
+        normalized = str(direction).strip().lower()
+        if normalized not in {"left", "right"}:
+            raise ValueError("一号关节方向必须是 left 或 right")
+        with self._condition:
+            if self._closed:
+                raise RuntimeError("推流服务已经关闭")
+            if not self._accepting_targets or self._stop_requested:
+                raise RuntimeError("机械臂当前不在等待目标，不能手动转动")
+            if self._pending_target_command is not None:
+                raise RuntimeError("抓取目标已经提交，不能手动转动")
+            if self._joint1_jog_active:
+                raise RuntimeError("一号关节转动请求正在处理中")
+            self._pending_joint1_jog = normalized
+            self._joint1_jog_active = True
+            label = "左" if normalized == "left" else "右"
+            self._control_message = f"已请求一号关节向{label}转动 0.5 rad。"
+            self._condition.notify_all()
+
+    def poll_joint1_jog(self) -> str | None:
+        with self._condition:
+            direction = self._pending_joint1_jog
+            self._pending_joint1_jog = None
+            return direction
+
+    def finish_joint1_jog(self, message: str) -> None:
+        with self._condition:
+            self._joint1_jog_active = False
+            if not self._stop_requested:
+                self._control_message = str(message)
+            self._condition.notify_all()
+
     def set_accepting_targets(self, accepting: bool) -> None:
         """Only permit browser commands while the operator prompt is active."""
         with self._condition:
             self._accepting_targets = bool(accepting)
             if not self._accepting_targets:
                 self._pending_target_command = None
+                self._pending_joint1_jog = None
+                self._joint1_jog_active = False
             self._condition.notify_all()
 
     def set_control_message(self, message: str) -> None:
@@ -446,6 +490,8 @@ class VisionStreamer:
             self._stop_requested = True
             self._accepting_targets = False
             self._pending_target_command = None
+            self._pending_joint1_jog = None
+            self._joint1_jog_active = False
             self._control_message = "结束请求已接收：机械臂正在返回程序启动姿态。"
             callback = self._stop_callback
             self._condition.notify_all()
@@ -461,6 +507,12 @@ class VisionStreamer:
             return {
                 "selected_color": selected,
                 "accepting_targets": self._accepting_targets,
+                "accepting_jog": (
+                    self._accepting_targets
+                    and not self._joint1_jog_active
+                    and not self._stop_requested
+                ),
+                "jog_active": self._joint1_jog_active,
                 "pending": self._pending_target_command is not None,
                 "stop_requested": self._stop_requested,
                 "message": self._control_message,
@@ -706,7 +758,7 @@ class _VisionStreamHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         path = self.path.split("?", 1)[0]
-        if path not in ("/api/target", "/api/stop"):
+        if path not in ("/api/target", "/api/stop", "/api/joint1"):
             self._send_json(404, {"message": "接口不存在"})
             return
         try:
@@ -724,6 +776,17 @@ class _VisionStreamHandler(BaseHTTPRequestHandler):
                     else "结束请求已经在处理中。"
                 )
                 self._send_json(202, {"message": message})
+                return
+            if path == "/api/joint1":
+                direction = payload.get("direction")
+                if not isinstance(direction, str):
+                    raise ValueError("一号关节方向必须是字符串")
+                self.streamer.submit_joint1_jog(direction)
+                label = "左" if direction.strip().lower() == "left" else "右"
+                self._send_json(
+                    202,
+                    {"message": f"一号关节向{label}转动请求已提交。"},
+                )
                 return
             if payload.get("confirmed") is not True:
                 raise ValueError("必须确认现场安全")

@@ -13,6 +13,7 @@ import numpy as np
 from .grasp_config import GraspConfig
 from .vision_pipeline import (
     apply_accumulated_color,
+    detect_requested_color_regions,
     get_base_camera_transform,
     grasp_geometry,
     grasp_rotation_from_mask,
@@ -100,16 +101,22 @@ class GraspPlanner:
             return self.robot.current_joint_position()
 
     def solve_ik(self, target_joint6, tool_rotation, seed, jump_limit):
+        started = time.monotonic()
         with self.sdk_call():
             joints = self.robot.inverse_kinematics(
                 target_joint6.tolist(),
                 tool_rotation,
                 seed.tolist(),
-                multi_init=True,
-                num_attempts=8,
+                multi_init=False,
+                max_iter=self.config.ik_single_seed_max_iterations,
             )
+        elapsed = time.monotonic() - started
         if joints is None:
-            print("[IK] solver returned no solution for this seed.")
+            print(
+                f"[IK] explicit seed failed after {elapsed:.2f}s "
+                f"({self.config.ik_single_seed_max_iterations} iteration limit).",
+                flush=True,
+            )
             return None
         joints = np.asarray(joints, dtype=float)
         if joints.shape != (6,) or not np.all(np.isfinite(joints)):
@@ -158,6 +165,7 @@ class GraspPlanner:
                 f"pos_err={position_error:.4f} m, rot_err={rotation_error:.2f} deg"
             )
             return None
+        print(f"[IK] explicit seed accepted in {elapsed:.2f}s.", flush=True)
         return joints
 
     def validate_candidate(
@@ -168,19 +176,38 @@ class GraspPlanner:
         seeds,
         jump_limit,
         label="candidate",
+        check_workspace=True,
     ):
         """Apply the same workspace and IK policy to every grasp backend."""
         tool_target = np.asarray(tool_target, dtype=float)
         joint6_target = np.asarray(joint6_target, dtype=float)
         tool_rotation = np.asarray(tool_rotation, dtype=float)
-        if not workspace_ok(tool_target, joint6_target, self.config):
+        if check_workspace and not workspace_ok(
+            tool_target, joint6_target, self.config
+        ):
             print(f"[PLAN] {label} rejected by workspace limits.")
             return None
+        unique_seeds = []
         for seed in seeds:
+            candidate_seed = np.asarray(seed, dtype=float)
+            if candidate_seed.shape != (6,) or not np.all(np.isfinite(candidate_seed)):
+                continue
+            if not any(np.allclose(candidate_seed, old) for old in unique_seeds):
+                unique_seeds.append(candidate_seed.copy())
+        unique_seeds = unique_seeds[: self.config.ik_max_seed_attempts]
+        print(
+            f"[PLAN] {label}: bounded IK with {len(unique_seeds)} explicit seed(s).",
+            flush=True,
+        )
+        for index, seed in enumerate(unique_seeds, start=1):
+            print(
+                f"[IK] {label}: seed {index}/{len(unique_seeds)} ...",
+                flush=True,
+            )
             solution = self.solve_ik(
                 joint6_target,
                 tool_rotation,
-                np.asarray(seed, dtype=float),
+                seed,
                 jump_limit,
             )
             if solution is not None:
@@ -209,18 +236,42 @@ class GraspPlanner:
             raise RuntimeError("final grasp is too far from the current pose")
         return final
 
-    def move_j(self, joints, duration, label, wait=True):
+    def move_j(
+        self,
+        joints,
+        duration,
+        label,
+        wait=True,
+        position_tolerance=None,
+    ):
         joints = np.asarray(joints, dtype=float)
+        timeout = max(
+            self.config.move_wait_min_timeout_s,
+            float(duration) + self.config.move_wait_margin_s,
+        )
+        print(
+            f"[MOVE] {label}: duration={duration:.1f}s, "
+            f"feedback_timeout={timeout:.1f}s ...",
+            flush=True,
+        )
+        started = time.monotonic()
+        move_kwargs = {
+            "duration": duration,
+            "max_torque": self.config.max_torque,
+            "label": label,
+            "wait": wait,
+            "timeout": timeout,
+        }
+        if position_tolerance is not None:
+            move_kwargs["tolerance"] = float(position_tolerance)
         with self.sdk_call():
-            result = self.robot.move_j_checked(
-                joints,
-                duration=duration,
-                max_torque=self.config.max_torque,
-                label=label,
-                wait=wait,
-            )
+            result = self.robot.move_j_checked(joints, **move_kwargs)
         if result is False:
             raise RuntimeError(f"{label} move failed")
+        print(
+            f"[MOVE] {label}: completed in {time.monotonic() - started:.2f}s.",
+            flush=True,
+        )
         self._remember_command(joints)
         if self.lifecycle_state not in {
             RobotLifecycleState.STOPPING,
@@ -327,6 +378,12 @@ class GraspPlanner:
         return False, last_position, last_torque, "timeout"
 
     def settle_at_grasp(self, target_joints, duration=2.0, pos_tol=0.015, vel_tol=0.2):
+        """Passively verify the endpoint after the checked trajectory finishes.
+
+        Do not resend ``Joint_Pos_Vel`` with a zero velocity vector here.  Real
+        logs showed that command increased endpoint error from roughly
+        0.02--0.03 rad to about 0.04 rad instead of correcting the pose.
+        """
         target_joints = np.asarray(target_joints, dtype=float)
         deadline = time.monotonic() + duration
         pos_err = float("inf")
@@ -345,13 +402,6 @@ class GraspPlanner:
                     f"vel_max={vel_max:.4f}, settled=True"
                 )
                 return True
-            with self.sdk_call():
-                self.robot.Joint_Pos_Vel(
-                    target_joints.tolist(),
-                    [0.0] * 6,
-                    self.config.max_torque,
-                    iswait=False,
-                )
             time.sleep(0.05)
         print(
             f"[GRASP] settle result: pos_err={pos_err:.4f}, "
@@ -392,8 +442,12 @@ class GraspPlanner:
         deadline = time.monotonic() + cfg.detection_stationary_timeout
         stable = 0
         latest = None
+        previous = None
         while time.monotonic() < deadline and not self.interrupted.is_set():
             with self.sdk_call():
+                refresh = getattr(self.robot, "refresh_motor_state", None)
+                if callable(refresh):
+                    refresh()
                 latest = np.asarray(self.robot.current_joint_position(), dtype=float)
                 velocity = np.asarray(self.robot.get_current_vel(), dtype=float)
             if (
@@ -403,14 +457,27 @@ class GraspPlanner:
                 or not np.all(np.isfinite(velocity))
             ):
                 raise RuntimeError("invalid joint feedback while waiting for camera stability")
-            if float(np.max(np.abs(velocity))) <= cfg.detection_stationary_velocity_tolerance:
+            position_delta = (
+                float("inf")
+                if previous is None
+                else float(np.max(np.abs(latest - previous)))
+            )
+            if (
+                position_delta <= cfg.detection_stationary_joint_tolerance
+                and float(np.max(np.abs(velocity)))
+                <= cfg.detection_stationary_velocity_tolerance
+            ):
                 stable += 1
                 if stable >= cfg.detection_stationary_stable_samples:
                     return latest
             else:
                 stable = 0
+            previous = latest.copy()
             time.sleep(0.05)
-        print("[VISION] arm did not become stationary before RGB-D capture.")
+        print(
+            "[VISION] arm did not become stationary before RGB-D capture: "
+            f"q={None if latest is None else np.round(latest, 4)}"
+        )
         return None
 
     def pre_grasp_alignment(self, found, current_joints=None):
@@ -428,8 +495,90 @@ class GraspPlanner:
         orientation = self.rotation_error_deg(current_rotation, tool_rotation)
         return axial, lateral, orientation, current_tool, approach
 
+    def plan_observation_pose(self, tcp_camera, found):
+        """Plan a partial camera-centering move without changing TCP rotation."""
+        cfg = self.config
+        camera_point = np.asarray(found["camera_point"], dtype=float)
+        if camera_point.shape != (3,) or not np.all(np.isfinite(camera_point)):
+            raise RuntimeError("invalid camera point for observation pre-grasp")
+        camera_depth = float(camera_point[2])
+        available_depth = max(
+            0.0,
+            camera_depth - cfg.observation_min_camera_distance_m,
+        )
+        axial_advance = min(
+            cfg.observation_max_advance_m,
+            cfg.observation_axial_gain * available_depth,
+        )
+        if 0.0 < axial_advance < cfg.observation_min_advance_m:
+            axial_advance = 0.0
+
+        lateral = cfg.observation_centering_gain * camera_point[:2]
+        lateral_norm = float(np.linalg.norm(lateral))
+        if lateral_norm > cfg.observation_max_lateral_shift_m:
+            lateral *= cfg.observation_max_lateral_shift_m / lateral_norm
+        camera_translation = np.array(
+            [lateral[0], lateral[1], axial_advance],
+            dtype=float,
+        )
+        translation_norm = float(np.linalg.norm(camera_translation))
+        if translation_norm > cfg.observation_max_translation_m:
+            camera_translation *= cfg.observation_max_translation_m / translation_norm
+            translation_norm = cfg.observation_max_translation_m
+        if translation_norm < cfg.observation_min_advance_m:
+            print(
+                "[OBSERVE] target is already close to the camera observation centre; "
+                "skipping observation motion but still re-detecting."
+            )
+            return None
+
+        current = self.current_joint_position()
+        with self.sdk_call():
+            base_camera = get_base_camera_transform(
+                self.robot,
+                tcp_camera,
+                current,
+                tcp_in_joint6=cfg.tcp_in_joint6,
+            )
+        base_from_camera = np.asarray(base_camera[:3, :3], dtype=float)
+        desired_camera = (
+            np.asarray(base_camera[:3, 3], dtype=float)
+            + base_from_camera @ camera_translation
+        )
+        tcp_rotation = np.asarray(tcp_camera[:3, :3], dtype=float)
+        tcp_translation = np.asarray(tcp_camera[:3, 3], dtype=float)
+        observation_rotation = base_from_camera @ tcp_rotation.T
+        observation_tool = (
+            desired_camera - observation_rotation @ tcp_translation
+        )
+        observation_joint6 = (
+            observation_tool - observation_rotation @ cfg.tcp_in_joint6
+        )
+        planned = self.validate_candidate(
+            observation_tool,
+            observation_joint6,
+            observation_rotation,
+            (current,),
+            cfg.observation_max_joint_step,
+            label="camera observation",
+            check_workspace=False,
+        )
+        if planned is None:
+            print(
+                "[OBSERVE] local observation IK is unavailable; keeping the "
+                "current camera pose and continuing bounded multi-frame refinement.",
+                flush=True,
+            )
+            return None
+        print(
+            "[OBSERVE] partial eye-in-hand correction: "
+            f"camera_delta={np.round(camera_translation, 4)} m, "
+            f"travel={translation_norm:.3f} m, tool={np.round(observation_tool, 3)} m"
+        )
+        return planned
+
     def plan_pre_grasp(self, found):
-        """Plan a waypoint 5 cm behind the compensated final grasp pose."""
+        """Plan a clamped half-gap standoff along the final approach axis."""
         cfg = self.config
         tool_target = np.asarray(found["tool_target"], dtype=float)
         tool_rotation = np.asarray(found["tool_rotation"], dtype=float)
@@ -443,26 +592,36 @@ class GraspPlanner:
         axial, lateral, orientation, _current_tool, _approach = self.pre_grasp_alignment(
             found, current_joints
         )
+        if axial <= 0.0:
+            raise RuntimeError(
+                f"tip is on or beyond the grasp plane: axial={axial:.3f} m"
+            )
+        if axial < cfg.pre_grasp_min_distance_m:
+            raise RuntimeError(
+                "tip is too close for a free-space orientation change: "
+                f"axial={axial:.3f} m"
+            )
         if (
-            cfg.pre_grasp_min_distance_m <= axial <= cfg.pre_grasp_offset_m
+            cfg.pre_grasp_min_distance_m <= axial <= cfg.pre_grasp_max_distance_m
             and lateral <= cfg.pre_grasp_lateral_tolerance_m
             and orientation <= cfg.pre_grasp_orientation_tolerance_deg
         ):
+            found["approach_standoff_m"] = axial
             print(
                 f"[PREGRASP] already inside approach corridor: axial={axial:.3f} m, "
                 f"lateral={lateral:.3f} m, rotation={orientation:.2f} deg; "
                 "skipping the free-space waypoint."
             )
             return None
-        if (
-            axial < cfg.pre_grasp_min_distance_m
-            and lateral <= cfg.pre_grasp_lateral_tolerance_m
-        ):
-            raise RuntimeError(
-                f"tip is too close to or beyond the grasp plane: axial={axial:.3f} m"
-            )
 
-        pre_tool_target = tool_target - cfg.pre_grasp_offset_m * approach
+        standoff = float(
+            np.clip(
+                cfg.pre_grasp_standoff_ratio * axial,
+                cfg.pre_grasp_min_distance_m,
+                cfg.pre_grasp_max_distance_m,
+            )
+        )
+        pre_tool_target = tool_target - standoff * approach
         tcp_offset = tool_rotation @ cfg.tcp_in_joint6
         pre_joint6_target = pre_tool_target - tcp_offset
         seed = np.asarray(found.get("provisional_joints", current_joints), dtype=float)
@@ -479,14 +638,15 @@ class GraspPlanner:
         )
         if planned is None:
             raise RuntimeError("pre-grasp validation failed; direct fallback is unsafe")
+        found["approach_standoff_m"] = standoff
         print(
-            f"[PREGRASP] planned tip waypoint {cfg.pre_grasp_offset_m:.3f} m "
-            f"before final grasp: {np.round(pre_tool_target, 3)}"
+            f"[PREGRASP] adaptive standoff={standoff:.3f} m "
+            f"from current axial gap={axial:.3f} m: {np.round(pre_tool_target, 3)}"
         )
         return planned
 
     def plan_cartesian_approach(self, found):
-        """Plan and validate the final straight TCP approach sample by sample."""
+        """Plan and validate the final converging TCP approach sample by sample."""
         cfg = self.config
         current = self.wait_until_stationary()
         if current is None:
@@ -495,7 +655,9 @@ class GraspPlanner:
             found, current
         )
         if not (
-            cfg.pre_grasp_min_distance_m <= axial <= cfg.pre_grasp_offset_m + 0.005
+            cfg.pre_grasp_min_distance_m - 0.003
+            <= axial
+            <= cfg.pre_grasp_max_distance_m + 0.005
             and lateral <= cfg.pre_grasp_lateral_tolerance_m
             and orientation <= cfg.pre_grasp_orientation_tolerance_deg
         ):
@@ -531,9 +693,26 @@ class GraspPlanner:
         if len(trajectory) < 2:
             raise RuntimeError("Cartesian approach contains no motion samples")
 
+        target_tool = np.asarray(found["tool_target"], dtype=float)
+        path_vector = target_tool - start_tool
+        path_length = float(np.linalg.norm(path_vector))
+        if path_length < 1e-6:
+            raise RuntimeError("Cartesian approach path is too short")
+        path_direction = path_vector / path_length
+        lateral_ceiling = min(
+            cfg.pre_grasp_lateral_tolerance_m + 0.003,
+            max(
+                lateral + 0.003,
+                cfg.approach_path_lateral_tolerance_m,
+            ),
+        )
         previous_progress = -1e-6
+        previous_path_progress = -1e-6
+        previous_remaining_lateral = lateral + 1e-6
         previous_joints = trajectory[0]
         jump_limit = float(getattr(self.robot, "jump_threshold", 1.5))
+        max_path_cross_track = 0.0
+        max_remaining_lateral = 0.0
         for index, joints in enumerate(trajectory):
             if (
                 joints.shape != (6,)
@@ -554,21 +733,50 @@ class GraspPlanner:
             if not workspace_ok(tool, joint6, cfg):
                 raise RuntimeError(f"Cartesian sample {index} leaves the workspace")
             progress = float(np.dot(tool - start_tool, approach))
-            cross_track = float(
-                np.linalg.norm((tool - start_tool) - progress * approach)
+            path_progress = float(np.dot(tool - start_tool, path_direction))
+            path_cross_track = float(
+                np.linalg.norm(
+                    (tool - start_tool) - path_progress * path_direction
+                )
             )
             if progress + 1e-4 < previous_progress or progress > axial + 0.001:
                 raise RuntimeError(f"Cartesian sample {index} is not axially monotonic")
-            if cross_track > cfg.approach_path_lateral_tolerance_m:
+            if (
+                path_progress + 1e-4 < previous_path_progress
+                or path_progress > path_length + 0.001
+            ):
                 raise RuntimeError(
-                    f"Cartesian sample {index} cross-track error={cross_track:.4f} m"
+                    f"Cartesian sample {index} does not advance along the planned segment"
+                )
+            if path_cross_track > cfg.approach_path_lateral_tolerance_m:
+                raise RuntimeError(
+                    f"Cartesian sample {index} leaves the commanded segment: "
+                    f"cross-track={path_cross_track:.4f} m"
+                )
+            remaining = target_tool - tool
+            remaining_axial = float(np.dot(remaining, approach))
+            remaining_lateral = float(
+                np.linalg.norm(remaining - remaining_axial * approach)
+            )
+            if remaining_lateral > lateral_ceiling:
+                raise RuntimeError(
+                    f"Cartesian sample {index} leaves the approach corridor: "
+                    f"lateral={remaining_lateral:.4f} m"
+                )
+            if remaining_lateral > previous_remaining_lateral + 0.003:
+                raise RuntimeError(
+                    f"Cartesian sample {index} diverges laterally from the target"
                 )
             if self.rotation_error_deg(rotation, end_pose["rotation"]) > (
                 cfg.pre_grasp_orientation_tolerance_deg
             ):
                 raise RuntimeError(f"Cartesian sample {index} rotates outside tolerance")
             previous_progress = progress
+            previous_path_progress = path_progress
+            previous_remaining_lateral = remaining_lateral
             previous_joints = joints
+            max_path_cross_track = max(max_path_cross_track, path_cross_track)
+            max_remaining_lateral = max(max_remaining_lateral, remaining_lateral)
 
         endpoint_tool, endpoint_rotation = self.current_tool_pose(trajectory[-1])
         endpoint_error = float(
@@ -584,9 +792,169 @@ class GraspPlanner:
             raise RuntimeError("Cartesian endpoint orientation is inaccurate")
         print(
             f"[PREGRASP] Cartesian approach verified: travel={axial:.3f} m, "
-            f"samples={len(trajectory)}, endpoint_error={endpoint_error:.4f} m"
+            f"samples={len(trajectory)}, endpoint_error={endpoint_error:.4f} m, "
+            f"segment_cross_track_max={max_path_cross_track:.4f} m, "
+            f"approach_lateral_max={max_remaining_lateral:.4f} m"
         )
         return trajectory
+
+    def plan_pre_grasp_realignment(self, found):
+        """Correct residual lateral error before the strict axial approach.
+
+        The free-space MoveJ waypoint can be accepted by the motor controller
+        while the TCP is still a few centimetres from its Cartesian target.
+        This bounded correction moves back to the already validated standoff;
+        it never advances through the grasp plane.  The final approach then
+        validates deviation from its commanded Cartesian segment separately
+        from the lateral error that is converging toward the grasp axis.
+        """
+        cfg = self.config
+        current = self.wait_until_stationary()
+        if current is None:
+            raise RuntimeError("arm is not stationary before pre-grasp realignment")
+        axial, lateral, orientation, start_tool, approach = self.pre_grasp_alignment(
+            found, current
+        )
+        if (
+            cfg.pre_grasp_min_distance_m - 0.003
+            <= axial
+            <= cfg.pre_grasp_max_distance_m + 0.005
+            and lateral <= cfg.pre_grasp_lateral_tolerance_m
+            and orientation <= cfg.pre_grasp_orientation_tolerance_deg
+        ):
+            return None
+
+        if axial < cfg.pre_grasp_min_distance_m - 0.003:
+            raise RuntimeError(
+                "pre-grasp realignment would start too close to the target: "
+                f"axial={axial:.3f} m"
+            )
+        if orientation > cfg.pre_grasp_realign_max_orientation_deg:
+            raise RuntimeError(
+                "pre-grasp realignment orientation is too far from target: "
+                f"rotation={orientation:.2f} deg"
+            )
+
+        tool_target = np.asarray(found["tool_target"], dtype=float)
+        tool_rotation = np.asarray(found["tool_rotation"], dtype=float)
+        standoff = float(
+            np.clip(
+                found.get("approach_standoff_m", cfg.pre_grasp_max_distance_m),
+                cfg.pre_grasp_min_distance_m,
+                cfg.pre_grasp_max_distance_m,
+            )
+        )
+        desired_tool = tool_target - standoff * approach
+        correction = desired_tool - start_tool
+        correction_norm = float(np.linalg.norm(correction))
+        if correction_norm > cfg.pre_grasp_realign_max_translation_m:
+            raise RuntimeError(
+                "pre-grasp residual is too large for bounded realignment: "
+                f"translation={correction_norm:.3f} m"
+            )
+
+        with self.sdk_call():
+            fk = self.robot.forward_kinematics(current)
+        if fk is None:
+            raise RuntimeError("FK failed before pre-grasp realignment")
+        start_pose = {
+            "position": np.asarray(fk["position"], dtype=float),
+            "rotation": np.asarray(fk["rotation"], dtype=float),
+        }
+        desired_joint6 = desired_tool - tool_rotation @ cfg.tcp_in_joint6
+        end_pose = {
+            "position": desired_joint6,
+            "rotation": tool_rotation,
+        }
+        with self.sdk_call():
+            planned, fraction = self.robot.compute_cartesian_path(
+                [start_pose, end_pose], avoid_collisions=False
+            )
+        if planned is None or float(fraction) < 0.999999:
+            raise RuntimeError(
+                "pre-grasp Cartesian realignment incomplete: "
+                f"fraction={float(fraction):.3f}"
+            )
+        trajectory = [np.asarray(current, dtype=float)] + [
+            np.asarray(joints, dtype=float) for joints in planned
+        ]
+        if len(trajectory) < 2:
+            raise RuntimeError("pre-grasp realignment contains no motion samples")
+
+        previous_distance = correction_norm + 1e-6
+        previous_joints = trajectory[0]
+        jump_limit = float(getattr(self.robot, "jump_threshold", 1.5))
+        for index, joints in enumerate(trajectory):
+            if (
+                joints.shape != (6,)
+                or not np.all(np.isfinite(joints))
+                or np.any(joints < cfg.joint_lower)
+                or np.any(joints > cfg.joint_upper)
+            ):
+                raise RuntimeError(
+                    f"pre-grasp realignment sample {index} violates joint limits"
+                )
+            if index and float(np.max(np.abs(joints - previous_joints))) > jump_limit:
+                raise RuntimeError(
+                    f"pre-grasp realignment sample {index} has a joint jump"
+                )
+            sample_tool, sample_rotation = self.current_tool_pose(joints)
+            sample_joint6 = sample_tool - sample_rotation @ cfg.tcp_in_joint6
+            if not workspace_ok(sample_tool, sample_joint6, cfg):
+                raise RuntimeError(
+                    f"pre-grasp realignment sample {index} leaves the workspace"
+                )
+            sample_axial = float(np.dot(tool_target - sample_tool, approach))
+            if not (
+                cfg.pre_grasp_min_distance_m - 0.003
+                <= sample_axial
+                <= cfg.pre_grasp_max_distance_m + 0.010
+            ):
+                raise RuntimeError(
+                    f"pre-grasp realignment sample {index} has unsafe "
+                    f"axial gap={sample_axial:.4f} m"
+                )
+            distance = float(np.linalg.norm(sample_tool - desired_tool))
+            if distance > previous_distance + 0.003:
+                raise RuntimeError(
+                    f"pre-grasp realignment sample {index} diverges from waypoint"
+                )
+            if self.rotation_error_deg(sample_rotation, tool_rotation) > (
+                cfg.pre_grasp_realign_max_orientation_deg
+            ):
+                raise RuntimeError(
+                    f"pre-grasp realignment sample {index} rotates outside tolerance"
+                )
+            previous_distance = distance
+            previous_joints = joints
+
+        endpoint_tool, endpoint_rotation = self.current_tool_pose(trajectory[-1])
+        endpoint_error = float(np.linalg.norm(endpoint_tool - desired_tool))
+        if endpoint_error > cfg.pre_grasp_realign_endpoint_tolerance_m:
+            raise RuntimeError(
+                "pre-grasp realignment endpoint error="
+                f"{endpoint_error:.4f} m exceeds tolerance"
+            )
+        if self.rotation_error_deg(endpoint_rotation, tool_rotation) > (
+            cfg.pre_grasp_orientation_tolerance_deg
+        ):
+            raise RuntimeError("pre-grasp realignment endpoint orientation is inaccurate")
+        print(
+            "[PREGRASP] bounded Cartesian realignment verified: "
+            f"axial={axial:.3f} m, lateral={lateral:.3f} m, "
+            f"correction={correction_norm:.3f} m, samples={len(trajectory)}"
+        )
+        return trajectory
+
+    def execute_pre_grasp_realignment(self, trajectory):
+        with self.sdk_call():
+            self.robot.execute_joint_trajectory_checked(
+                trajectory,
+                duration=self.config.pre_grasp_realign_duration,
+                max_torque=self.config.max_torque,
+                label="PRE GRASP CARTESIAN REALIGNMENT",
+            )
+        self._remember_command(trajectory[-1])
 
     def execute_cartesian_approach(self, trajectory):
         with self.sdk_call():
@@ -598,7 +966,13 @@ class GraspPlanner:
             )
         self._remember_command(trajectory[-1])
 
-    def grasp_and_close(self, final, approach_trajectory, streamer=None):
+    def grasp_and_close(
+        self,
+        final,
+        approach_trajectory,
+        streamer=None,
+        found=None,
+    ):
         cfg = self.config
         print("[GRASP] opening gripper before direct grasp ...")
         self.open_gripper()
@@ -621,11 +995,58 @@ class GraspPlanner:
         settled = self.settle_at_grasp(
             final,
             duration=cfg.direct_grasp_settle_timeout,
-            pos_tol=0.015,
+            pos_tol=cfg.direct_grasp_joint_tolerance_rad,
             vel_tol=0.2,
         )
         if not settled:
-            raise RuntimeError("final grasp pose did not settle; gripper close aborted")
+            print(
+                "[GRASP] final pose did not settle inside the bounded joint "
+                "tolerance; gripper close aborted."
+            )
+            return False, float("nan"), float("nan")
+
+        tcp_residual_norm = float("nan")
+        if found is not None:
+            settled_joints = self.current_joint_position()
+            actual_tool, _actual_rotation = self.current_tool_pose(settled_joints)
+            tool_target = np.asarray(found["tool_target"], dtype=float)
+            residual_mm = (actual_tool - tool_target) * 1000.0
+            tcp_residual_norm = float(np.linalg.norm(actual_tool - tool_target))
+            print(
+                "[ACCURACY] actual TCP - software target in Base XYZ: "
+                f"{np.round(residual_mm, 1)} mm"
+            )
+            print(
+                "[ACCURACY] actual TCP residual norm: "
+                f"{tcp_residual_norm * 1000.0:.1f} mm"
+            )
+            if "base_point" in found:
+                detected_object = np.asarray(found["base_point"], dtype=float)
+                configured_offset_mm = (tool_target - detected_object) * 1000.0
+                actual_object_delta_mm = (actual_tool - detected_object) * 1000.0
+                print(
+                    "[ACCURACY] software target - detected object in Base XYZ: "
+                    f"{np.round(configured_offset_mm, 1)} mm"
+                )
+                print(
+                    "[ACCURACY] actual TCP - detected object in Base XYZ: "
+                    f"{np.round(actual_object_delta_mm, 1)} mm"
+                )
+                print(
+                    "[ACCURACY] commanded approach-axis overtravel: "
+                    f"{cfg.grasp_approach_overtravel_m * 1000.0:.1f} mm"
+                )
+        if (
+            np.isfinite(tcp_residual_norm)
+            and tcp_residual_norm > cfg.direct_grasp_tcp_tolerance_m
+        ):
+            print(
+                "[GRASP] actual TCP is outside the final Cartesian tolerance: "
+                f"{tcp_residual_norm:.4f} m > "
+                f"{cfg.direct_grasp_tcp_tolerance_m:.4f} m; "
+                "gripper close aborted."
+            )
+            return False, float("nan"), float("nan")
 
         print("[GRASP] closing gripper while holding arm ...")
         grasp_hold = self.current_joint_position()
@@ -715,6 +1136,44 @@ class GraspPlanner:
         pose[0] = float(joint1)
         return pose
 
+    def jog_joint1(self, direction):
+        """Move J1 by one bounded web-jog step while the arm is at HOME shape."""
+        cfg = self.config
+        direction = str(direction).strip().lower()
+        signs = {"left": 1.0, "right": -1.0}
+        if direction not in signs:
+            raise RuntimeError(f"invalid J1 jog direction: {direction!r}")
+        current = self.wait_until_stationary()
+        if current is None:
+            raise RuntimeError("arm is not stationary; J1 jog rejected")
+        non_j1_error = float(np.max(np.abs(current[1:] - cfg.home[1:])))
+        if non_j1_error > cfg.joint1_jog_posture_tolerance_rad:
+            raise RuntimeError(
+                "arm is outside the safe J1-jog posture: "
+                f"non_j1_error={non_j1_error:.3f} rad"
+            )
+        requested = float(current[0] + signs[direction] * cfg.joint1_jog_step_rad)
+        target_j1 = float(
+            np.clip(requested, cfg.joint_lower[0], cfg.joint_upper[0])
+        )
+        actual_step = target_j1 - float(current[0])
+        if abs(actual_step) < 1e-3:
+            side = "left" if direction == "left" else "right"
+            raise RuntimeError(f"J1 is already at the {side} joint limit")
+        target = current.copy()
+        target[0] = target_j1
+        side_label = "LEFT" if direction == "left" else "RIGHT"
+        print(
+            f"[WEB-JOG] J1 {side_label}: current={current[0]:+.3f}, "
+            f"requested={requested:+.3f}, target={target_j1:+.3f} rad",
+            flush=True,
+        )
+        self.move_j(target, cfg.joint1_jog_duration, f"WEB J1 {side_label}")
+        settled = self.wait_until_stationary()
+        if settled is None:
+            raise RuntimeError("J1 jog completed but the arm did not settle")
+        return float(settled[0])
+
     def _is_central_horizontal(self, detection):
         cfg = self.config
         ratio = float(np.clip(cfg.central_x_grasp_ratio, 0.0, 1.0))
@@ -737,6 +1196,8 @@ class GraspPlanner:
         scan_joint_position,
         joint1,
         label,
+        requested_color=None,
+        target_base_override=None,
     ):
         """Choose the highest-scoring GraspNet candidate that is reachable."""
         cfg = self.config
@@ -747,8 +1208,13 @@ class GraspPlanner:
 
         current_joints = self.current_joint_position()
         for detection in matches:
-            _camera_point, target_base_point = object_base_position(
+            camera_point, measured_base_point = object_base_position(
                 detection, intrinsic, base_camera
+            )
+            target_base_point = (
+                np.asarray(target_base_override, dtype=float)
+                if target_base_override is not None
+                else measured_base_point
             )
             candidates = self.graspnet_provider.generate_candidates(
                 capture["color_image"],
@@ -797,10 +1263,14 @@ class GraspPlanner:
                 print("=" * 68)
                 self._say(f"发现{detection['color']}积木，准备抓取")
                 return {
+                    "camera_point": camera_point,
                     "joint6_target": joint6_target,
                     "tool_rotation": tool_rotation,
                     "tool_target": tool_target,
                     "base_point": target_base_point,
+                    "detected_color": detection.get("color"),
+                    "requested_color": requested_color,
+                    "detection": detection,
                     "provisional_joints": provisional,
                     "scan_joint1": joint1,
                     "scan_joint_position": scan_joint_position,
@@ -825,6 +1295,7 @@ class GraspPlanner:
         base_camera,
         requested_color,
         after_sequence,
+        deadline=None,
     ):
         """Merge weak color evidence only while the arm is stationary."""
         cfg = self.config
@@ -839,10 +1310,20 @@ class GraspPlanner:
         _, tracked_point = object_base_position(tracked, intrinsic, base_camera)
         matched_frames = 1
         marker = after_sequence
+        if deadline is None:
+            deadline = time.monotonic() + cfg.color_accumulation_timeout_s
+        print(
+            "[COLOR] weak single-frame evidence; accumulating within "
+            f"{max(0.0, deadline - time.monotonic()):.1f}s budget.",
+            flush=True,
+        )
         for _frame_index in range(1, cfg.color_accumulation_max_frames):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0.0:
+                break
             capture = camera_feed.wait_for_newer(
                 marker,
-                timeout=cfg.camera_detection_timeout,
+                timeout=min(cfg.camera_detection_timeout, remaining),
             )
             if capture is None:
                 break
@@ -958,12 +1439,42 @@ class GraspPlanner:
                 self.robot,
                 tcp_camera,
                 scan_joint_position,
+                tcp_in_joint6=cfg.tcp_in_joint6,
             )
         capture["robot_joint_position"] = scan_joint_position.copy()
         capture["base_camera"] = np.asarray(base_camera, dtype=float).copy()
+        raw_detections = list(capture["detections"])
+        if selected_color is None:
+            known = [item for item in raw_detections if item.get("color") != "unknown"]
+            relevant_detections = known if known else raw_detections
+        else:
+            exact = [
+                item for item in raw_detections
+                if item.get("color") == selected_color
+            ]
+            uncertain = [
+                item for item in raw_detections
+                if item.get("color") == "unknown"
+                or float(item.get("color_confidence", 0.0))
+                < cfg.color_single_frame_strong_ratio
+            ]
+            relevant_detections = exact if exact else uncertain
+        relevant_detections.sort(
+            key=lambda item: (
+                float(item.get("color_confidence", 0.0)),
+                float(item.get("confidence", 0.0)),
+            ),
+            reverse=True,
+        )
+        print(
+            f"[COLOR] frame candidates={len(raw_detections)}, "
+            f"relevant={len(relevant_detections)} for {color_label}.",
+            flush=True,
+        )
         detections = []
         color_marker = capture["frame_seq"]
-        for candidate_index, detection in enumerate(capture["detections"], start=1):
+        color_deadline = time.monotonic() + cfg.color_accumulation_timeout_s
+        for candidate_index, detection in enumerate(relevant_detections, start=1):
             accumulated, color_marker = self._accumulate_candidate_color(
                 camera_feed,
                 detection,
@@ -971,6 +1482,7 @@ class GraspPlanner:
                 base_camera,
                 selected_color,
                 color_marker,
+                deadline=color_deadline,
             )
             print(
                 f"[COLOR] J1={joint1:+.2f} candidate {candidate_index}: "
@@ -1024,7 +1536,7 @@ class GraspPlanner:
                 print(f"[{label}] original target could not be tracked.")
                 return None
             target_shift, nearest_detection = min(tracked, key=lambda item: item[0])
-            if target_shift > cfg.pre_grasp_abort_shift_m:
+            if target_shift > cfg.refine_target_match_radius_m:
                 print(
                     f"[{label}] nearest same-colour target shifted {target_shift:.3f} m; "
                     "refusing to switch objects."
@@ -1042,6 +1554,7 @@ class GraspPlanner:
                 scan_joint_position,
                 joint1,
                 label,
+                requested_color=selected_color,
             )
 
         for detection in matches:
@@ -1104,10 +1617,14 @@ class GraspPlanner:
             print("=" * 68)
             self._say(f"发现{detection['color']}积木，准备抓取")
             return {
+                "camera_point": camera_point,
                 "joint6_target": joint6_target,
                 "tool_rotation": tool_rotation,
                 "tool_target": tool_target,
                 "base_point": base_point,
+                "detected_color": detection["color"],
+                "requested_color": selected_color,
+                "detection": detection,
                 "provisional_joints": provisional,
                 "scan_joint1": joint1,
                 "scan_joint_position": scan_joint_position,
@@ -1115,6 +1632,387 @@ class GraspPlanner:
 
         print(f"[{label}] J1={joint1:+.2f}: matching target is not graspable.")
         return None
+
+    @staticmethod
+    def _axis_error_deg(first, second, undirected=False):
+        first = np.asarray(first, dtype=float)
+        second = np.asarray(second, dtype=float)
+        first /= float(np.linalg.norm(first))
+        second /= float(np.linalg.norm(second))
+        cosine = float(np.dot(first, second))
+        if undirected:
+            cosine = abs(cosine)
+        return float(np.degrees(np.arccos(np.clip(cosine, -1.0, 1.0))))
+
+    def refine_target_at_observation_pose(
+        self,
+        camera_feed,
+        intrinsic,
+        tcp_camera,
+        selected_color,
+        found,
+        position_only=False,
+    ):
+        """Track one physical block over several coherent post-move snapshots."""
+        cfg = self.config
+        stage = "CLOSE-REFINE" if position_only else "REFINE"
+        stable_joints = self.wait_until_stationary()
+        if stable_joints is None:
+            return None
+        refine_started = time.monotonic()
+        refine_deadline = refine_started + cfg.refine_total_timeout_s
+        print(
+            f"[{stage}] bounded frame budget={cfg.refine_total_timeout_s:.1f}s, "
+            f"need={cfg.refine_required_observations} observation(s).",
+            flush=True,
+        )
+        marker_method = getattr(camera_feed, "freshness_marker", None)
+        marker = marker_method() if callable(marker_method) else time.monotonic()
+        for warmup_index in range(cfg.refine_frame_warmup):
+            remaining = refine_deadline - time.monotonic()
+            if remaining <= 0.0:
+                print(f"[{stage}] total frame budget expired during warmup.")
+                return None
+            capture = camera_feed.wait_for_newer(
+                marker,
+                timeout=min(cfg.refine_frame_timeout_s, remaining),
+            )
+            if capture is None:
+                print(
+                    f"[{stage}] warmup frame {warmup_index + 1}/"
+                    f"{cfg.refine_frame_warmup} timed out."
+                )
+                return None
+            marker = capture.get("frame_seq", capture["detections_timestamp"])
+
+        current_joints = self.current_joint_position()
+        if float(np.max(np.abs(current_joints - stable_joints))) > (
+            cfg.detection_stationary_joint_tolerance
+        ):
+            print(f"[{stage}] arm drifted during warmup; observation rejected.")
+            return None
+        with self.sdk_call():
+            base_camera = get_base_camera_transform(
+                self.robot,
+                tcp_camera,
+                current_joints,
+                tcp_in_joint6=cfg.tcp_in_joint6,
+            )
+
+        expected_base = np.asarray(found["base_point"], dtype=float)
+        tracked_color = selected_color or found.get("detected_color")
+        observations = []
+        last_intrinsic = intrinsic
+        quality_rejections = []
+        for attempt in range(1, cfg.refine_max_frame_attempts + 1):
+            remaining = refine_deadline - time.monotonic()
+            if remaining <= 0.0:
+                print(f"[{stage}] total frame budget expired.")
+                break
+            capture = camera_feed.wait_for_newer(
+                marker,
+                timeout=min(cfg.refine_frame_timeout_s, remaining),
+            )
+            if capture is None:
+                print(
+                    f"[{stage}] frame {attempt}/{cfg.refine_max_frame_attempts} "
+                    "timed out."
+                )
+                continue
+            marker = capture.get("frame_seq", capture["detections_timestamp"])
+            capture_intrinsic = capture.get("intrinsics")
+            if capture_intrinsic is not None:
+                last_intrinsic = capture_intrinsic
+            detections = list(capture.get("detections", []))
+            if tracked_color is not None and not any(
+                item.get("color") == tracked_color for item in detections
+            ):
+                fallback = detect_requested_color_regions(
+                    capture["color_image"],
+                    capture["depth_image"],
+                    camera_feed.depth_scale,
+                    tracked_color,
+                    cfg,
+                )
+                if fallback:
+                    print(
+                        f"[{stage}] frame {attempt}: detector missed {tracked_color}; "
+                        f"colour fallback found {len(fallback)} region(s)."
+                    )
+                    detections.extend(fallback)
+
+            nearest = None
+            nearest_camera = None
+            nearest_base = None
+            nearest_distance = float("inf")
+            for detection in detections:
+                if tracked_color is not None and detection.get("color") != tracked_color:
+                    continue
+                if position_only:
+                    depth_m = float(detection.get("depth_m", float("nan")))
+                    depth_spread_m = float(
+                        detection.get("depth_spread_m", float("inf"))
+                    )
+                    bbox = np.asarray(detection.get("bbox", ()), dtype=float)
+                    color_image = capture.get("color_image")
+                    if color_image is None or bbox.shape != (4,):
+                        quality_rejections.append("missing image/bbox")
+                        continue
+                    image_height, image_width = color_image.shape[:2]
+                    x1, y1, x2, y2 = bbox
+                    bbox_area_ratio = max(0.0, (x2 - x1) * (y2 - y1)) / float(
+                        image_width * image_height
+                    )
+                    margin = cfg.close_refine_border_margin_px
+                    if not np.isfinite(depth_m) or depth_m < cfg.close_refine_min_depth_m:
+                        quality_rejections.append(f"depth={depth_m:.3f}m")
+                        continue
+                    if depth_spread_m > cfg.close_refine_max_depth_spread_m:
+                        quality_rejections.append(
+                            f"depth_spread={depth_spread_m * 1000.0:.1f}mm"
+                        )
+                        continue
+                    if (
+                        x1 <= margin
+                        or y1 <= margin
+                        or x2 >= image_width - margin
+                        or y2 >= image_height - margin
+                    ):
+                        quality_rejections.append("bbox touches image border")
+                        continue
+                    if bbox_area_ratio > cfg.close_refine_max_bbox_area_ratio:
+                        quality_rejections.append(
+                            f"bbox_area={bbox_area_ratio:.1%}"
+                        )
+                        continue
+                center = np.asarray(detection["pixel"], dtype=float)
+                image_center = np.array(
+                    [last_intrinsic.ppx, last_intrinsic.ppy],
+                    dtype=float,
+                )
+                if float(np.linalg.norm(center - image_center)) > (
+                    cfg.refine_max_center_distance_px
+                ):
+                    continue
+                try:
+                    camera_point, base_point = object_base_position(
+                        detection,
+                        last_intrinsic,
+                        base_camera,
+                    )
+                except Exception:
+                    continue
+                distance = float(np.linalg.norm(base_point - expected_base))
+                if distance < nearest_distance:
+                    nearest = detection
+                    nearest_camera = camera_point
+                    nearest_base = base_point
+                    nearest_distance = distance
+
+            if nearest is None or nearest_distance > cfg.refine_target_match_radius_m:
+                quality_detail = ""
+                if position_only and quality_rejections:
+                    quality_detail = f", quality={quality_rejections[-3:]}"
+                print(
+                    f"[{stage}] frame {attempt}/{cfg.refine_max_frame_attempts}: "
+                    f"same target not found (detections={len(detections)}, "
+                    f"nearest={nearest_distance:.3f} m{quality_detail})."
+                )
+                continue
+            observations.append(
+                {
+                    "capture": capture,
+                    "detection": nearest,
+                    "camera_point": np.asarray(nearest_camera, dtype=float),
+                    "base_point": np.asarray(nearest_base, dtype=float),
+                    "distance": nearest_distance,
+                }
+            )
+            print(
+                f"[{stage}] observation {len(observations)}/"
+                f"{cfg.refine_required_observations}: "
+                f"base={np.round(nearest_base, 3)} m, match={nearest_distance:.3f} m, "
+                f"pixel={np.round(nearest['pixel'], 1)}, "
+                f"depth={float(nearest.get('depth_m', float('nan'))):.3f} m, "
+                f"spread={float(nearest.get('depth_spread_m', float('nan'))) * 1000.0:.1f} mm"
+            )
+            if len(observations) >= cfg.refine_required_observations:
+                break
+
+        if len(observations) < cfg.refine_required_observations:
+            print(
+                f"[{stage}] not enough coherent observations after "
+                f"{time.monotonic() - refine_started:.2f}s; returning to "
+                "recognition pose."
+            )
+            return None
+        points = np.asarray([item["base_point"] for item in observations], dtype=float)
+        refined_base = np.median(points, axis=0)
+        spread = float(np.max(np.linalg.norm(points - refined_base, axis=1)))
+        correction = refined_base - expected_base
+        correction_xy = float(np.linalg.norm(correction[:2]))
+        correction_z = abs(float(correction[2]))
+        correction_total = float(np.linalg.norm(correction))
+        spread_limit = (
+            cfg.close_refine_max_position_spread_m
+            if position_only
+            else cfg.refine_max_position_spread_m
+        )
+        xy_limit = (
+            cfg.close_refine_max_xy_correction_m
+            if position_only
+            else cfg.refine_max_xy_correction_m
+        )
+        z_limit = (
+            cfg.close_refine_max_z_correction_m
+            if position_only
+            else cfg.refine_max_z_correction_m
+        )
+        total_limit = (
+            cfg.close_refine_max_total_correction_m
+            if position_only
+            else cfg.refine_max_total_correction_m
+        )
+        print(
+            f"[{stage}] correction={np.round(correction, 4)} m, "
+            f"spread={spread:.3f} m"
+        )
+        if (
+            spread > spread_limit
+            or correction_xy > xy_limit
+            or correction_z > z_limit
+            or correction_total > total_limit
+        ):
+            print(f"[{stage}] correction/spread exceeds safety limits.")
+            return None
+
+        representative = min(
+            observations,
+            key=lambda item: float(np.linalg.norm(item["base_point"] - refined_base)),
+        )
+        if position_only:
+            tool_rotation = np.asarray(found["tool_rotation"], dtype=float)
+            try:
+                tool_target, joint6_target = grasp_geometry(
+                    refined_base,
+                    tool_rotation,
+                    cfg,
+                )
+            except Exception as exc:
+                print(f"[{stage}] position-only geometry rejected: {exc!r}")
+                return None
+            provisional = self.validate_candidate(
+                tool_target,
+                joint6_target,
+                tool_rotation,
+                (
+                    current_joints,
+                    found.get("provisional_joints", current_joints),
+                ),
+                cfg.max_home_to_grasp_step,
+                label="close-range position refinement",
+            )
+            if provisional is None:
+                return None
+            refreshed = dict(found)
+            refreshed.update(
+                {
+                    "camera_point": representative["camera_point"],
+                    "base_point": refined_base,
+                    "tool_target": tool_target,
+                    "joint6_target": joint6_target,
+                    "provisional_joints": provisional,
+                    "detection": representative["detection"],
+                }
+            )
+            print(
+                f"[{stage}] accepted position correction while preserving the "
+                "far-field grasp orientation."
+            )
+            return refreshed
+        if cfg.use_graspnet:
+            refreshed = self._select_graspnet_candidate(
+                camera_feed,
+                representative["capture"],
+                last_intrinsic,
+                base_camera,
+                [representative["detection"]],
+                current_joints,
+                float(current_joints[0]),
+                "REFINE",
+                requested_color=selected_color,
+                target_base_override=refined_base,
+            )
+            if refreshed is not None:
+                refreshed["scan_joint_position"] = found["scan_joint_position"]
+                refreshed["scan_joint1"] = found["scan_joint1"]
+            return refreshed
+        try:
+            (
+                tool_rotation,
+                approach_tilt_deg,
+                _jaw_angle_deg,
+                _jaw_image_angle_deg,
+                _projection_error_deg,
+            ) = grasp_rotation_from_mask(
+                representative["detection"],
+                representative["camera_point"],
+                last_intrinsic,
+                base_camera,
+                cfg,
+            )
+            tool_target, joint6_target = grasp_geometry(
+                refined_base,
+                tool_rotation,
+                cfg,
+            )
+        except Exception as exc:
+            print(f"[REFINE] refined geometry rejected: {exc!r}")
+            return None
+        initial_rotation = np.asarray(found["tool_rotation"], dtype=float)
+        open_axis_change = self._axis_error_deg(
+            initial_rotation[:, 1],
+            tool_rotation[:, 1],
+            undirected=True,
+        )
+        if (
+            approach_tilt_deg > cfg.refine_max_approach_tilt_deg
+            or open_axis_change > cfg.refine_max_open_axis_change_deg
+        ):
+            print(
+                "[REFINE] refined orientation rejected: "
+                f"tilt={approach_tilt_deg:.1f} deg, "
+                f"jaw_change={open_axis_change:.1f} deg"
+            )
+            return None
+        provisional = self.validate_candidate(
+            tool_target,
+            joint6_target,
+            tool_rotation,
+            (
+                current_joints,
+                found.get("provisional_joints", current_joints),
+                cfg.manual_grasp_ik_seed,
+            ),
+            cfg.max_home_to_grasp_step,
+            label="refined OBB grasp",
+        )
+        if provisional is None:
+            return None
+        refreshed = dict(found)
+        refreshed.update(
+            {
+                "camera_point": representative["camera_point"],
+                "base_point": refined_base,
+                "tool_target": tool_target,
+                "joint6_target": joint6_target,
+                "tool_rotation": tool_rotation,
+                "provisional_joints": provisional,
+                "detection": representative["detection"],
+                "detected_color": representative["detection"]["color"],
+            }
+        )
+        return refreshed
 
     def scan_for_target(
         self,
@@ -1131,6 +2029,28 @@ class GraspPlanner:
             f"step {cfg.scan_j1_step:.2f} rad."
         )
         self._say(f"开始寻找{color_label}积木")
+
+        current = self.current_joint_position()
+        current_joint1 = float(current[0])
+        print(
+            f"[FAST] checking the current camera pose first at "
+            f"J1={current_joint1:+.2f} rad ...",
+            flush=True,
+        )
+        result = self._detect_at_pose(
+            camera_feed,
+            intrinsic,
+            tcp_camera,
+            selected_color,
+            current_joint1,
+            "FAST",
+        )
+        if result is not None:
+            print("[FAST] target accepted without a J1 sweep.", flush=True)
+            return result
+        if self.interrupted.is_set():
+            return None
+        print("[FAST] target unavailable at current pose; starting J1 fallback sweep.")
 
         start_pose = self.scan_pose(cfg.scan_j1_start)
         print(f"[SCAN] moving HOME -> scan start J1={cfg.scan_j1_start:+.2f} rad ...")
@@ -1200,55 +2120,29 @@ class GraspPlanner:
         selected_color,
         found,
     ):
-        """Move to pre-grasp, re-detect the same object, then realign once."""
+        """Partially centre the eye-in-hand camera, then refine over fresh frames."""
         cfg = self.config
-        original_base_point = np.asarray(found["base_point"], dtype=float)
-        pre_grasp_joints = self.plan_pre_grasp(found)
-        if pre_grasp_joints is not None:
-            print("[PREGRASP] moving to the 5 cm waypoint ...")
+        observation_joints = self.plan_observation_pose(tcp_camera, found)
+        if observation_joints is not None:
+            print("[OBSERVE] moving halfway toward a safer centred camera view ...")
             self.move_j(
-                pre_grasp_joints,
+                observation_joints,
                 cfg.pre_grasp_duration,
-                "PRE GRASP",
+                "CAMERA OBSERVATION",
             )
         if not self.sleep_interruptible(cfg.pre_grasp_camera_settle_time):
             return None
-
-        current = self.current_joint_position()
-        print("[PREGRASP] acquiring a fresh RGB-D detection before final grasp ...")
-        refreshed = self._detect_at_pose(
+        print(
+            "[REFINE] acquiring several coherent RGB-D observations before "
+            "choosing the final grasp pose ..."
+        )
+        return self.refine_target_at_observation_pose(
             camera_feed,
             intrinsic,
             tcp_camera,
             selected_color,
-            float(current[0]),
-            "PREGRASP",
-            reference_base_point=original_base_point,
+            found,
         )
-        if refreshed is None:
-            raise RuntimeError(
-                "target was not confirmed from the pre-grasp pose; grasp aborted"
-            )
-        target_shift = float(
-            np.linalg.norm(np.asarray(refreshed["base_point"]) - original_base_point)
-        )
-        print(f"[PREGRASP] refreshed target shift={target_shift:.3f} m")
-
-        correction = self.plan_pre_grasp(refreshed)
-        if correction is not None:
-            if target_shift > cfg.pre_grasp_abort_shift_m:
-                raise RuntimeError(
-                    f"refreshed target shifted {target_shift:.3f} m; grasp aborted"
-                )
-            print("[PREGRASP] realigning to the refreshed 5 cm waypoint ...")
-            self.move_j(
-                correction,
-                cfg.pre_grasp_duration,
-                "REFRESHED PRE GRASP",
-            )
-            if not self.sleep_interruptible(cfg.pre_grasp_camera_settle_time):
-                return None
-        return refreshed
 
     def _return_to_recognition_pose(self, scan_joints, streamer, reason):
         """Recover from an empty grasp without terminating the operator loop."""
@@ -1324,13 +2218,21 @@ class GraspPlanner:
                         )
                         break
 
-                found = self.pre_grasp_and_redetect(
-                    camera_feed,
-                    intrinsic,
-                    tcp_camera,
-                    selected_color,
-                    found,
-                )
+                try:
+                    if streamer is not None:
+                        streamer.set_control_message(
+                            "目标已锁定，正在计算观察位并进行多帧复检。"
+                        )
+                    found = self.pre_grasp_and_redetect(
+                        camera_feed,
+                        intrinsic,
+                        tcp_camera,
+                        selected_color,
+                        found,
+                    )
+                except RuntimeError as exc:
+                    print(f"[OBSERVE] planning/re-detection failed safely: {exc}")
+                    found = None
                 if self.interrupted.is_set():
                     return False
                 if found is None:
@@ -1342,8 +2244,89 @@ class GraspPlanner:
                     )
                     break
 
-                print("[PREGRASP] refreshed target found; validating straight approach ...")
-                approach_trajectory = self.plan_cartesian_approach(found)
+                try:
+                    if streamer is not None:
+                        streamer.set_control_message(
+                            "复检通过，正在规划自适应预抓取和直线接近。"
+                        )
+                    pre_grasp_joints = self.plan_pre_grasp(found)
+                    if pre_grasp_joints is not None:
+                        print(
+                            "[PREGRASP] moving to the adaptive half-gap "
+                            "approach waypoint ..."
+                        )
+                        self.move_j(
+                            pre_grasp_joints,
+                            cfg.pre_grasp_duration,
+                            "ADAPTIVE PRE GRASP",
+                            position_tolerance=cfg.pre_grasp_joint_tolerance_rad,
+                        )
+                        if not self.sleep_interruptible(
+                            cfg.pre_grasp_camera_settle_time
+                        ):
+                            return False
+                    realignment_trajectory = self.plan_pre_grasp_realignment(found)
+                    if realignment_trajectory is not None:
+                        print(
+                            "[PREGRASP] correcting residual TCP error at the "
+                            "safe standoff before the final approach ..."
+                        )
+                        self.execute_pre_grasp_realignment(realignment_trajectory)
+                        if not self.sleep_interruptible(
+                            cfg.pre_grasp_camera_settle_time
+                        ):
+                            return False
+                    if cfg.close_refine_enabled and not cfg.use_graspnet:
+                        print(
+                            "[CLOSE-REFINE] acquiring a bounded position-only "
+                            "RGB-D correction at the safe standoff ..."
+                        )
+                        close_refined = self.refine_target_at_observation_pose(
+                            camera_feed,
+                            intrinsic,
+                            tcp_camera,
+                            selected_color,
+                            found,
+                            position_only=True,
+                        )
+                        if close_refined is None:
+                            print(
+                                "[CLOSE-REFINE] close image is incomplete or "
+                                "unstable; keeping the previously validated "
+                                "far-field target."
+                            )
+                        else:
+                            close_correction = (
+                                np.asarray(close_refined["base_point"], dtype=float)
+                                - np.asarray(found["base_point"], dtype=float)
+                            )
+                            found = close_refined
+                            print(
+                                "[CLOSE-REFINE] accepted Base correction: "
+                                f"{np.round(close_correction * 1000.0, 1)} mm; "
+                                "re-aligning the safe standoff."
+                            )
+                            close_realignment = self.plan_pre_grasp_realignment(found)
+                            if close_realignment is not None:
+                                self.execute_pre_grasp_realignment(close_realignment)
+                                if not self.sleep_interruptible(
+                                    cfg.pre_grasp_camera_settle_time
+                                ):
+                                    return False
+                    print(
+                        "[PREGRASP] waypoint aligned; validating the straight "
+                        "final approach ..."
+                    )
+                    approach_trajectory = self.plan_cartesian_approach(found)
+                except RuntimeError as exc:
+                    print(f"[PREGRASP] final approach rejected safely: {exc}")
+                    self.open_gripper()
+                    self._return_to_recognition_pose(
+                        retry_scan_position,
+                        streamer,
+                        "预抓取或直线接近规划失败",
+                    )
+                    break
                 final = np.asarray(approach_trajectory[-1], dtype=float)
                 print("[PLAN] full Cartesian approach verified; auto grasp starts now.")
 
@@ -1351,6 +2334,7 @@ class GraspPlanner:
                     final,
                     approach_trajectory,
                     streamer=streamer,
+                    found=found,
                 )
                 if not clamped:
                     print("[GRASP] clamp failed; releasing for another target.")

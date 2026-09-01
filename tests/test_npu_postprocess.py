@@ -23,6 +23,37 @@ class NpuPostprocessTests(unittest.TestCase):
 
         self.assertEqual(kept, [0, 2])
 
+    def test_decode_rejects_invalid_labels_and_off_image_boxes(self):
+        detector = NpuYoloDetector.__new__(NpuYoloDetector)
+        detector.names = ("a", "b", "c", "d")
+        detector.confidence = 0.15
+        detector.iou_threshold = 0.45
+        detector.pre_nms_top_k = 50
+        detector.max_detections = 20
+        detector.input_size = 640
+
+        pred = np.zeros((300, 38), dtype=np.float32)
+        pred[:, 5] = 99.0
+        pred[0, :6] = [100, 100, 200, 200, 0.8, 1]
+        pred[1, :6] = [100, 100, 200, 200, 0.9, 9]
+        pred[2, :6] = [-100, 50, -20, 100, 0.9, 2]
+        pred[3, :6] = [300, 100, 400, 200, 0.9, 1.5]
+        proto = np.zeros((32, 160, 160), dtype=np.float32)
+
+        result = detector._decode(
+            [pred.tobytes(), proto.tobytes()],
+            height=480,
+            width=640,
+            ratio=1.0,
+            dx=0,
+            dy=80,
+        )
+
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0]["cls"], 1)
+        self.assertGreaterEqual(detector.last_decode_stats["invalid_label"], 2)
+        self.assertGreaterEqual(detector.last_decode_stats["invalid_box"], 1)
+
 
 if __name__ == "__main__":
     unittest.main()

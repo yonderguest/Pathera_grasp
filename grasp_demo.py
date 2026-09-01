@@ -82,12 +82,33 @@ signal.signal(signal.SIGINT, on_signal)
 signal.signal(signal.SIGTERM, on_signal)
 
 
-def read_terminal_command(streamer=None) -> str | None:
+def read_terminal_command(streamer=None, joint1_jog_callback=None) -> str | None:
     """Read one terminal or browser command while remaining interruptible."""
     safe_print("> ", end="")
     terminal_available = bool(sys.stdin.isatty())
     while not shutdown_requested.is_set():
         if streamer is not None:
+            poll_jog = getattr(streamer, "poll_joint1_jog", None)
+            jog_direction = poll_jog() if callable(poll_jog) else None
+            if jog_direction is not None:
+                try:
+                    if joint1_jog_callback is None:
+                        raise RuntimeError("J1 jog controller is unavailable")
+                    final_j1 = float(joint1_jog_callback(jog_direction))
+                    label = "左" if jog_direction == "left" else "右"
+                    message = f"一号关节已向{label}转动；当前 J1={final_j1:+.2f} rad。"
+                    safe_print(f"\n[WEB-JOG] {message}")
+                    finish_jog = getattr(streamer, "finish_joint1_jog", None)
+                    if callable(finish_jog):
+                        finish_jog(message)
+                except Exception as exc:
+                    message = f"一号关节转动被拒绝：{exc}"
+                    safe_print(f"\n[WEB-JOG] {message}")
+                    finish_jog = getattr(streamer, "finish_joint1_jog", None)
+                    if callable(finish_jog):
+                        finish_jog(message)
+                safe_print("> ", end="")
+                continue
             command = streamer.poll_target_command()
             if command is not None:
                 safe_print(f"\n[WEB] 收到网页目标：{command}")
@@ -107,7 +128,7 @@ def read_terminal_command(streamer=None) -> str | None:
     return None
 
 
-def choose_target_at_start(voice=None, streamer=None):
+def choose_target_at_start(voice=None, streamer=None, joint1_jog_callback=None):
     def finish(value):
         if streamer is not None:
             streamer.set_accepting_targets(False)
@@ -119,7 +140,7 @@ def choose_target_at_start(voice=None, streamer=None):
     if streamer is not None:
         streamer.set_accepting_targets(True)
         streamer.set_control_message(
-            "请选择目标颜色并确认现场安全；提交后机械臂会自动开始扫描。"
+            "请选择目标颜色；提交前请确认机械臂路径内无人、无障碍物。"
         )
     if voice is not None and voice.available:
         voice.say("请说出要抓取的颜色，例如红色积木")
@@ -141,7 +162,7 @@ def choose_target_at_start(voice=None, streamer=None):
             )
     while not shutdown_requested.is_set():
         try:
-            command = read_terminal_command(streamer)
+            command = read_terminal_command(streamer, joint1_jog_callback)
         except (EOFError, KeyboardInterrupt):
             return finish(False)
         if command is None:
@@ -320,7 +341,11 @@ def main():
             intrinsic,
             tcp_camera,
             streamer,
-            lambda: choose_target_at_start(voice, streamer),
+            lambda: choose_target_at_start(
+                voice,
+                streamer,
+                planner.jog_joint1,
+            ),
         )
         if task_complete:
             safe_print("[GRASP] scan, grasp and placement completed; returning to ZERO.")
@@ -328,8 +353,10 @@ def main():
         safe_print(f"[MAIN] exception: {exc!r}")
         exit_code = 1
     finally:
+        pipeline_for_shutdown = pipeline
         if camera_feed is not None:
             camera_feed.stop()
+            pipeline_for_shutdown = None
         if npu_detector is not None:
             npu_detector.close()
         if streamer is not None:
@@ -338,14 +365,14 @@ def main():
             safe_print("[STREAM] web preview closed.")
         if planner is not None:
             if not planner.safe_shutdown(
-                pipeline,
+                pipeline_for_shutdown,
                 shutdown_target=startup_joint_position,
                 shutdown_label="STARTUP POSE",
             ):
                 exit_code = max(exit_code, 2)
-        elif pipeline is not None:
+        elif pipeline_for_shutdown is not None:
             try:
-                pipeline.stop()
+                pipeline_for_shutdown.stop()
             except Exception:
                 pass
         if voice is not None:

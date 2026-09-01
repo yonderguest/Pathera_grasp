@@ -11,6 +11,7 @@ from Panthera_lib.grasp_planner import (
     GraspPlanner,
     RobotLifecycleState,
 )
+from Panthera_lib.vision_pipeline import grasp_geometry
 
 
 class NoopRobot:
@@ -18,6 +19,102 @@ class NoopRobot:
 
 
 class PlannerSafetyTests(unittest.TestCase):
+    def test_planner_ik_uses_one_bounded_explicit_seed(self):
+        class Robot:
+            def __init__(self):
+                self.kwargs = None
+
+            def inverse_kinematics(self, *_args, **kwargs):
+                self.kwargs = kwargs
+                return np.zeros(6)
+
+            def forward_kinematics(self, _joints):
+                return {"position": np.zeros(3), "rotation": np.eye(3)}
+
+        robot = Robot()
+        config = GraspConfig()
+        planner = GraspPlanner(robot, config, threading.Event())
+
+        result = planner.solve_ik(
+            np.zeros(3),
+            np.eye(3),
+            np.zeros(6),
+            jump_limit=1.0,
+        )
+
+        self.assertIsNotNone(result)
+        self.assertFalse(robot.kwargs["multi_init"])
+        self.assertEqual(
+            robot.kwargs["max_iter"],
+            config.ik_single_seed_max_iterations,
+        )
+
+    def test_candidate_validation_deduplicates_and_caps_seed_attempts(self):
+        config = GraspConfig()
+        config.ik_max_seed_attempts = 2
+        planner = GraspPlanner(NoopRobot(), config, threading.Event())
+        attempts = []
+        planner.solve_ik = lambda _target, _rotation, seed, _jump: (
+            attempts.append(np.asarray(seed).copy()) or None
+        )
+
+        result = planner.validate_candidate(
+            np.array([0.30, 0.0, 0.10]),
+            np.array([0.20, 0.0, 0.10]),
+            np.eye(3),
+            (
+                np.zeros(6),
+                np.zeros(6),
+                np.ones(6),
+                np.full(6, 2.0),
+            ),
+            3.0,
+            label="bounded test",
+        )
+
+        self.assertIsNone(result)
+        self.assertEqual(len(attempts), 2)
+        self.assertTrue(np.allclose(attempts[0], np.zeros(6)))
+        self.assertTrue(np.allclose(attempts[1], np.ones(6)))
+
+    def test_move_wait_uses_duration_bounded_feedback_timeout(self):
+        class Robot:
+            def __init__(self):
+                self.kwargs = None
+
+            def move_j_checked(self, *_args, **kwargs):
+                self.kwargs = kwargs
+                return True
+
+        robot = Robot()
+        config = GraspConfig()
+        planner = GraspPlanner(robot, config, threading.Event())
+
+        planner.move_j(np.zeros(6), 3.0, "TEST MOVE")
+
+        self.assertEqual(robot.kwargs["timeout"], 7.0)
+
+    def test_move_can_request_tighter_pre_grasp_joint_tolerance(self):
+        class Robot:
+            def __init__(self):
+                self.kwargs = None
+
+            def move_j_checked(self, *_args, **kwargs):
+                self.kwargs = kwargs
+                return True
+
+        robot = Robot()
+        planner = GraspPlanner(robot, GraspConfig(), threading.Event())
+
+        planner.move_j(
+            np.zeros(6),
+            3.0,
+            "PREGRASP",
+            position_tolerance=0.02,
+        )
+
+        self.assertEqual(robot.kwargs["tolerance"], 0.02)
+
     def test_edge_visible_block_is_inside_expanded_image_region(self):
         planner = GraspPlanner(NoopRobot(), GraspConfig(), threading.Event())
         self.assertTrue(
@@ -27,7 +124,120 @@ class PlannerSafetyTests(unittest.TestCase):
             planner._is_central_horizontal({"bbox": (0, 100, 40, 180)})
         )
 
-    def test_pre_grasp_retreats_five_centimetres_along_approach(self):
+    def test_web_joint1_jog_moves_only_joint1_by_half_radian(self):
+        class Robot:
+            def __init__(self):
+                self.command = None
+
+            def move_j_checked(self, joints, **_kwargs):
+                self.command = np.asarray(joints, dtype=float)
+                return True
+
+        robot = Robot()
+        config = GraspConfig()
+        planner = GraspPlanner(robot, config, threading.Event())
+        initial = config.home.copy()
+        settled = initial.copy()
+        settled[0] = 0.5
+        samples = iter((initial, settled))
+        planner.wait_until_stationary = lambda: next(samples)
+
+        final_j1 = planner.jog_joint1("left")
+
+        self.assertAlmostEqual(final_j1, 0.5)
+        self.assertTrue(np.allclose(robot.command[1:], initial[1:]))
+        self.assertAlmostEqual(float(robot.command[0]), 0.5)
+
+    def test_grasp_overtravel_follows_pose_specific_approach_axis(self):
+        config = GraspConfig()
+        config.grasp_approach_overtravel_m = 0.005
+        base_point = np.array([0.10, -0.02, 0.12])
+        tool_rotation = np.array(
+            [
+                [0.0, -1.0, 0.0],
+                [1.0, 0.0, 0.0],
+                [0.0, 0.0, 1.0],
+            ]
+        )
+
+        tool_target, joint6_target = grasp_geometry(
+            base_point,
+            tool_rotation,
+            config,
+        )
+
+        nominal = base_point + config.grasp_offset_base
+        self.assertTrue(
+            np.allclose(
+                tool_target - nominal,
+                [0.0, config.grasp_approach_overtravel_m, 0.0],
+            )
+        )
+        self.assertTrue(
+            np.allclose(
+                joint6_target,
+                tool_target - tool_rotation @ config.tcp_in_joint6,
+            )
+        )
+
+    def test_grasp_settle_is_passive_and_does_not_resend_zero_velocity(self):
+        class Robot:
+            @staticmethod
+            def get_current_vel():
+                return np.zeros(6)
+
+            def Joint_Pos_Vel(self, *_args, **_kwargs):
+                self.fail("settle verification must not resend a zero-velocity move")
+
+        planner = GraspPlanner(Robot(), GraspConfig(), threading.Event())
+        samples = iter((np.full(6, 0.02), np.zeros(6)))
+        planner.current_joint_position = lambda: next(samples)
+
+        self.assertTrue(
+            planner.settle_at_grasp(
+                np.zeros(6),
+                duration=0.2,
+                pos_tol=0.01,
+                vel_tol=0.1,
+            )
+        )
+
+    def test_web_joint1_jog_rejects_non_home_arm_shape(self):
+        config = GraspConfig()
+        planner = GraspPlanner(NoopRobot(), config, threading.Event())
+        unsafe = config.home.copy()
+        unsafe[1] += config.joint1_jog_posture_tolerance_rad + 0.1
+        planner.wait_until_stationary = lambda: unsafe
+
+        with self.assertRaises(RuntimeError):
+            planner.jog_joint1("right")
+
+    def test_stationary_check_refreshes_motor_feedback_before_sampling(self):
+        class Robot:
+            def __init__(self):
+                self.refresh_count = 0
+
+            def refresh_motor_state(self):
+                self.refresh_count += 1
+
+            def current_joint_position(self):
+                return np.zeros(6)
+
+            def get_current_vel(self):
+                return np.zeros(6)
+
+        config = GraspConfig()
+        config.detection_stationary_stable_samples = 2
+        config.detection_stationary_timeout = 0.3
+        robot = Robot()
+        planner = GraspPlanner(robot, config, threading.Event())
+
+        stable = planner.wait_until_stationary()
+
+        self.assertTrue(np.allclose(stable, np.zeros(6)))
+        self.assertGreaterEqual(robot.refresh_count, 3)
+
+    def test_pre_grasp_uses_half_current_axial_gap(self):
         class Robot:
             def current_joint_position(self):
                 return np.zeros(6)
@@ -47,7 +257,7 @@ class PlannerSafetyTests(unittest.TestCase):
 
         planner.validate_candidate = validate
         found = {
-            "tool_target": np.array([0.40, 0.0, 0.10]),
+            "tool_target": np.array([0.315, 0.0, 0.10]),
             "tool_rotation": np.eye(3),
             "provisional_joints": np.zeros(6),
         }
@@ -55,11 +265,12 @@ class PlannerSafetyTests(unittest.TestCase):
         result = planner.plan_pre_grasp(found)
 
         self.assertTrue(np.all(result == 1.0))
-        self.assertTrue(np.allclose(captured["tool"], [0.35, 0.0, 0.10]))
-        self.assertTrue(np.allclose(captured["joint6"], [0.185, 0.0, 0.10]))
+        self.assertTrue(np.allclose(captured["tool"], [0.290, 0.0, 0.10]))
+        self.assertTrue(np.allclose(captured["joint6"], [0.125, 0.0, 0.10]))
+        self.assertAlmostEqual(found["approach_standoff_m"], 0.025)
         self.assertEqual(captured["label"], "pre-grasp")
 
-    def test_pre_grasp_is_skipped_when_tip_is_already_within_five_centimetres(self):
+    def test_pre_grasp_is_skipped_inside_adaptive_approach_corridor(self):
         class Robot:
             def current_joint_position(self):
                 return np.zeros(6)
@@ -80,6 +291,110 @@ class PlannerSafetyTests(unittest.TestCase):
         )
 
         self.assertIsNone(result)
+
+    def test_pre_grasp_half_gap_is_clamped_to_maximum(self):
+        class Robot:
+            def current_joint_position(self):
+                return np.zeros(6)
+
+            def forward_kinematics(self, joints):
+                return {"position": [0.10, 0.0, 0.10], "rotation": np.eye(3)}
+
+        planner = GraspPlanner(Robot(), GraspConfig(), threading.Event())
+        captured = {}
+
+        def validate(tool, *_args, **_kwargs):
+            captured["tool"] = np.asarray(tool)
+            return np.ones(6)
+
+        planner.validate_candidate = validate
+        found = {
+            "tool_target": np.array([0.45, 0.0, 0.10]),
+            "tool_rotation": np.eye(3),
+        }
+
+        planner.plan_pre_grasp(found)
+
+        self.assertAlmostEqual(found["approach_standoff_m"], 0.040)
+        self.assertTrue(np.allclose(captured["tool"], [0.410, 0.0, 0.10]))
+
+    def test_observation_move_halves_image_error_and_preserves_camera_pose(self):
+        class Robot:
+            def current_joint_position(self):
+                return np.zeros(6)
+
+        config = GraspConfig()
+        planner = GraspPlanner(Robot(), config, threading.Event())
+        captured = {}
+
+        def validate(tool, joint6, rotation, *_args, **_kwargs):
+            captured["tool"] = np.asarray(tool)
+            captured["joint6"] = np.asarray(joint6)
+            captured["rotation"] = np.asarray(rotation)
+            return np.ones(6)
+
+        planner.validate_candidate = validate
+        base_camera = np.eye(4)
+        base_camera[:3, 3] = [0.20, 0.00, 0.20]
+        with patch(
+            "Panthera_lib.grasp_planner.get_base_camera_transform",
+            return_value=base_camera,
+        ):
+            result = planner.plan_observation_pose(
+                np.eye(4),
+                {"camera_point": np.array([0.04, -0.02, 0.30])},
+            )
+
+        self.assertTrue(np.all(result == 1.0))
+        self.assertTrue(np.allclose(captured["rotation"], np.eye(3)))
+        self.assertTrue(np.allclose(captured["tool"], [0.22, -0.01, 0.225]))
+        self.assertTrue(
+            np.allclose(captured["joint6"], [0.055, -0.01, 0.225])
+        )
+
+    def test_unreachable_observation_pose_falls_back_to_stationary_refinement(self):
+        class Robot:
+            def current_joint_position(self):
+                return np.zeros(6)
+
+        planner = GraspPlanner(Robot(), GraspConfig(), threading.Event())
+        planner.validate_candidate = lambda *args, **kwargs: None
+        with patch(
+            "Panthera_lib.grasp_planner.get_base_camera_transform",
+            return_value=np.eye(4),
+        ):
+            result = planner.plan_observation_pose(
+                np.eye(4),
+                {"camera_point": np.array([0.04, 0.00, 0.30])},
+            )
+
+        self.assertIsNone(result)
+
+    def test_scan_accepts_current_pose_before_starting_joint_sweep(self):
+        planner = GraspPlanner(NoopRobot(), GraspConfig(), threading.Event())
+        current = np.array([0.4, 0.2, 1.0, -1.2, 0.0, 0.0])
+        planner.current_joint_position = lambda: current.copy()
+        labels = []
+        expected = {"scan_joint_position": current.copy()}
+
+        def detect(*_args, **_kwargs):
+            labels.append(_args[5])
+            return expected
+
+        planner._detect_at_pose = detect
+        planner.move_j = lambda *_args, **_kwargs: self.fail(
+            "J1 sweep must not start when current-pose detection succeeds"
+        )
+
+        result = planner.scan_for_target(
+            camera_feed=object(),
+            intrinsic=object(),
+            tcp_camera=np.eye(4),
+            selected_color="blue",
+        )
+
+        self.assertIs(result, expected)
+        self.assertEqual(labels, ["FAST"])
 
     def test_pre_grasp_does_not_skip_a_laterally_offset_pose(self):
         class Robot:
@@ -119,20 +434,38 @@ class PlannerSafetyTests(unittest.TestCase):
                 }
             )
 
+    def test_pre_grasp_rejects_tip_too_close_for_orientation_change(self):
+        class Robot:
+            def current_joint_position(self):
+                return np.zeros(6)
+
+            def forward_kinematics(self, joints):
+                return {"position": [0.225, 0.0, 0.10], "rotation": np.eye(3)}
+
+        planner = GraspPlanner(Robot(), GraspConfig(), threading.Event())
+
+        with self.assertRaises(RuntimeError):
+            planner.plan_pre_grasp(
+                {
+                    "tool_target": np.array([0.40, 0.0, 0.10]),
+                    "tool_rotation": np.eye(3),
+                }
+            )
+
     def test_cartesian_approach_is_sampled_and_monotonic(self):
         class Robot:
             jump_threshold = 1.5
 
             def forward_kinematics(self, joints):
                 return {
-                    "position": [0.185 + float(joints[0]), 0.0, 0.10],
+                    "position": [0.195 + float(joints[0]), 0.0, 0.10],
                     "rotation": np.eye(3),
                 }
 
             def compute_cartesian_path(self, waypoints, avoid_collisions=False):
                 return [
                     np.array([step, 0, 0, 0, 0, 0], dtype=float)
-                    for step in np.linspace(0.01, 0.05, 5)
+                    for step in np.linspace(0.008, 0.04, 5)
                 ], 1.0
 
         planner = GraspPlanner(Robot(), GraspConfig(), threading.Event())
@@ -147,7 +480,125 @@ class PlannerSafetyTests(unittest.TestCase):
         )
 
         self.assertEqual(len(trajectory), 6)
-        self.assertAlmostEqual(float(trajectory[-1][0]), 0.05)
+        self.assertAlmostEqual(float(trajectory[-1][0]), 0.04)
+
+    def test_cartesian_approach_accepts_lateral_convergence_to_target(self):
+        class Robot:
+            jump_threshold = 1.5
+
+            def __init__(self):
+                self.start_joint6 = np.array([0.195, 0.008, 0.10])
+                self.end_joint6 = np.array([0.235, 0.000, 0.10])
+
+            def forward_kinematics(self, joints):
+                progress = float(np.asarray(joints)[0])
+                position = self.start_joint6 + progress * (
+                    self.end_joint6 - self.start_joint6
+                )
+                return {"position": position, "rotation": np.eye(3)}
+
+            def compute_cartesian_path(self, waypoints, avoid_collisions=False):
+                return [
+                    np.array([step, 0, 0, 0, 0, 0], dtype=float)
+                    for step in np.linspace(0.2, 1.0, 5)
+                ], 1.0
+
+        planner = GraspPlanner(Robot(), GraspConfig(), threading.Event())
+        planner.wait_until_stationary = lambda: np.zeros(6)
+
+        trajectory = planner.plan_cartesian_approach(
+            {
+                "tool_target": np.array([0.40, 0.0, 0.10]),
+                "joint6_target": np.array([0.235, 0.0, 0.10]),
+                "tool_rotation": np.eye(3),
+            }
+        )
+
+        self.assertEqual(len(trajectory), 6)
+        endpoint_tool, _ = planner.current_tool_pose(trajectory[-1])
+        self.assertTrue(np.allclose(endpoint_tool, [0.40, 0.0, 0.10]))
+
+    def test_cartesian_approach_rejects_true_departure_from_commanded_segment(self):
+        class Robot:
+            jump_threshold = 1.5
+
+            def forward_kinematics(self, joints):
+                joints = np.asarray(joints, dtype=float)
+                return {
+                    "position": [0.195 + 0.040 * joints[0], joints[1], 0.10],
+                    "rotation": np.eye(3),
+                }
+
+            def compute_cartesian_path(self, waypoints, avoid_collisions=False):
+                return [
+                    np.array([0.5, 0.008, 0, 0, 0, 0], dtype=float),
+                    np.array([1.0, 0.000, 0, 0, 0, 0], dtype=float),
+                ], 1.0
+
+        planner = GraspPlanner(Robot(), GraspConfig(), threading.Event())
+        planner.wait_until_stationary = lambda: np.zeros(6)
+
+        with self.assertRaisesRegex(RuntimeError, "leaves the commanded segment"):
+            planner.plan_cartesian_approach(
+                {
+                    "tool_target": np.array([0.40, 0.0, 0.10]),
+                    "joint6_target": np.array([0.235, 0.0, 0.10]),
+                    "tool_rotation": np.eye(3),
+                }
+            )
+
+    def test_pre_grasp_realignment_retreats_and_removes_lateral_error(self):
+        class Robot:
+            jump_threshold = 1.5
+
+            def __init__(self):
+                self.start_joint6 = np.array([0.205, 0.025, 0.10])
+                self.end_joint6 = np.array([0.195, 0.0, 0.10])
+
+            def forward_kinematics(self, joints):
+                progress = float(np.asarray(joints)[0])
+                position = self.start_joint6 + progress * (
+                    self.end_joint6 - self.start_joint6
+                )
+                return {"position": position, "rotation": np.eye(3)}
+
+            def compute_cartesian_path(self, waypoints, avoid_collisions=False):
+                return [
+                    np.array([0.5, 0, 0, 0, 0, 0], dtype=float),
+                    np.array([1.0, 0, 0, 0, 0, 0], dtype=float),
+                ], 1.0
+
+        planner = GraspPlanner(Robot(), GraspConfig(), threading.Event())
+        planner.wait_until_stationary = lambda: np.zeros(6)
+        found = {
+            "tool_target": np.array([0.40, 0.0, 0.10]),
+            "tool_rotation": np.eye(3),
+            "approach_standoff_m": 0.040,
+        }
+
+        trajectory = planner.plan_pre_grasp_realignment(found)
+
+        self.assertEqual(len(trajectory), 3)
+        endpoint_tool, _ = planner.current_tool_pose(trajectory[-1])
+        self.assertTrue(np.allclose(endpoint_tool, [0.36, 0.0, 0.10]))
+
+    def test_pre_grasp_realignment_is_skipped_inside_strict_corridor(self):
+        class Robot:
+            def forward_kinematics(self, joints):
+                return {"position": [0.205, 0.0, 0.10], "rotation": np.eye(3)}
+
+        planner = GraspPlanner(Robot(), GraspConfig(), threading.Event())
+        planner.wait_until_stationary = lambda: np.zeros(6)
+
+        result = planner.plan_pre_grasp_realignment(
+            {
+                "tool_target": np.array([0.40, 0.0, 0.10]),
+                "tool_rotation": np.eye(3),
+                "approach_standoff_m": 0.030,
+            }
+        )
+
+        self.assertIsNone(result)
 
     def test_partial_cartesian_approach_is_rejected_before_execution(self):
         class Robot:
@@ -155,7 +606,7 @@ class PlannerSafetyTests(unittest.TestCase):
 
             def forward_kinematics(self, joints):
                 return {
-                    "position": [0.185 + float(joints[0]), 0.0, 0.10],
+                    "position": [0.195 + float(joints[0]), 0.0, 0.10],
                     "rotation": np.eye(3),
                 }
 
@@ -174,12 +625,11 @@ class PlannerSafetyTests(unittest.TestCase):
                 }
             )
 
-    def test_pre_grasp_always_redetects_even_when_move_is_skipped(self):
+    def test_observation_always_refines_even_when_move_is_skipped(self):
         planner = GraspPlanner(NoopRobot(), GraspConfig(), threading.Event())
-        planner.plan_pre_grasp = lambda found: None
+        planner.plan_observation_pose = lambda tcp_camera, found: None
         planner.sleep_interruptible = lambda seconds: True
-        planner.current_joint_position = lambda: np.array([0.3, 0, 0, 0, 0, 0])
-        planner._detect_at_pose = lambda *args, **kwargs: {
+        planner.refine_target_at_observation_pose = lambda *args, **kwargs: {
             "refreshed": True,
             "base_point": np.zeros(3),
         }
@@ -189,10 +639,199 @@ class PlannerSafetyTests(unittest.TestCase):
             intrinsic=object(),
             tcp_camera=np.eye(4),
             selected_color="green",
-            found={"tool_target": np.zeros(3), "base_point": np.zeros(3)},
+            found={"camera_point": np.zeros(3), "base_point": np.zeros(3)},
         )
 
         self.assertTrue(result["refreshed"])
+
+    def test_refinement_uses_three_coherent_observations_not_one_frame(self):
+        config = GraspConfig()
+        config.refine_frame_warmup = 1
+        config.refine_required_observations = 3
+        config.refine_max_frame_attempts = 3
+        planner = GraspPlanner(NoopRobot(), config, threading.Event())
+        planner.wait_until_stationary = lambda: np.zeros(6)
+        planner.current_joint_position = lambda: np.zeros(6)
+        planner.validate_candidate = lambda *args, **kwargs: np.ones(6)
+
+        class Intrinsic:
+            ppx = 320.0
+            ppy = 240.0
+
+        def capture(sequence, point):
+            detection = {
+                "pixel": (320.0, 240.0),
+                "color": "red",
+                "point": np.asarray(point, dtype=float),
+            }
+            return {
+                "frame_seq": sequence,
+                "detections_timestamp": float(sequence),
+                "detections": [detection],
+                "intrinsics": Intrinsic(),
+                "color_image": np.zeros((2, 2, 3), dtype=np.uint8),
+                "depth_image": np.ones((2, 2), dtype=np.uint16),
+            }
+
+        frames = iter(
+            [
+                capture(1, [0.300, 0.000, 0.100]),
+                capture(2, [0.302, 0.001, 0.101]),
+                capture(3, [0.299, -0.001, 0.100]),
+                capture(4, [0.301, 0.000, 0.099]),
+            ]
+        )
+
+        class Feed:
+            depth_scale = 0.001
+
+            @staticmethod
+            def freshness_marker():
+                return 0
+
+            @staticmethod
+            def wait_for_newer(_marker, timeout):
+                return next(frames)
+
+        found = {
+            "base_point": np.array([0.300, 0.000, 0.100]),
+            "tool_rotation": np.eye(3),
+            "provisional_joints": np.zeros(6),
+            "scan_joint_position": np.zeros(6),
+            "scan_joint1": 0.0,
+            "detected_color": "red",
+        }
+        with (
+            patch(
+                "Panthera_lib.grasp_planner.get_base_camera_transform",
+                return_value=np.eye(4),
+            ),
+            patch(
+                "Panthera_lib.grasp_planner.object_base_position",
+                side_effect=lambda detection, *_args: (
+                    detection["point"],
+                    detection["point"],
+                ),
+            ),
+            patch(
+                "Panthera_lib.grasp_planner.grasp_rotation_from_mask",
+                return_value=(np.eye(3), 0.0, 0.0, 0.0, 0.0),
+            ),
+            patch(
+                "Panthera_lib.grasp_planner.grasp_geometry",
+                side_effect=lambda point, _rotation, _config: (
+                    np.asarray(point),
+                    np.asarray(point),
+                ),
+            ),
+        ):
+            result = planner.refine_target_at_observation_pose(
+                Feed(),
+                Intrinsic(),
+                np.eye(4),
+                "red",
+                found,
+            )
+
+        self.assertIsNotNone(result)
+        self.assertTrue(
+            np.allclose(result["base_point"], [0.301, 0.000, 0.100])
+        )
+
+    def test_close_refinement_updates_position_but_preserves_far_orientation(self):
+        config = GraspConfig()
+        config.refine_frame_warmup = 1
+        config.refine_required_observations = 3
+        config.refine_max_frame_attempts = 3
+        planner = GraspPlanner(NoopRobot(), config, threading.Event())
+        planner.wait_until_stationary = lambda: np.zeros(6)
+        planner.current_joint_position = lambda: np.zeros(6)
+        planner.validate_candidate = lambda *args, **kwargs: np.ones(6)
+
+        class Intrinsic:
+            ppx = 320.0
+            ppy = 240.0
+
+        def capture(sequence, point):
+            detection = {
+                "pixel": (320.0, 240.0),
+                "bbox": (280, 200, 360, 280),
+                "color": "blue",
+                "depth_m": 0.100,
+                "depth_spread_m": 0.002,
+                "point": np.asarray(point, dtype=float),
+            }
+            return {
+                "frame_seq": sequence,
+                "detections_timestamp": float(sequence),
+                "detections": [detection],
+                "intrinsics": Intrinsic(),
+                "color_image": np.zeros((480, 640, 3), dtype=np.uint8),
+                "depth_image": np.ones((480, 640), dtype=np.uint16),
+            }
+
+        frames = iter(
+            [
+                capture(1, [0.300, 0.000, 0.100]),
+                capture(2, [0.304, 0.002, 0.103]),
+                capture(3, [0.305, 0.001, 0.102]),
+                capture(4, [0.303, 0.002, 0.103]),
+            ]
+        )
+
+        class Feed:
+            depth_scale = 0.001
+
+            @staticmethod
+            def freshness_marker():
+                return 0
+
+            @staticmethod
+            def wait_for_newer(_marker, timeout):
+                return next(frames)
+
+        far_rotation = np.array(
+            [[0.0, -1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]]
+        )
+        found = {
+            "base_point": np.array([0.300, 0.000, 0.100]),
+            "tool_rotation": far_rotation,
+            "provisional_joints": np.zeros(6),
+            "detected_color": "blue",
+        }
+        with (
+            patch(
+                "Panthera_lib.grasp_planner.get_base_camera_transform",
+                return_value=np.eye(4),
+            ),
+            patch(
+                "Panthera_lib.grasp_planner.object_base_position",
+                side_effect=lambda detection, *_args: (
+                    detection["point"],
+                    detection["point"],
+                ),
+            ),
+            patch(
+                "Panthera_lib.grasp_planner.grasp_rotation_from_mask",
+                side_effect=AssertionError(
+                    "close refinement must preserve far-field orientation"
+                ),
+            ),
+        ):
+            result = planner.refine_target_at_observation_pose(
+                Feed(),
+                Intrinsic(),
+                np.eye(4),
+                "blue",
+                found,
+                position_only=True,
+            )
+
+        self.assertIsNotNone(result)
+        self.assertTrue(np.allclose(result["tool_rotation"], far_rotation))
+        self.assertTrue(
+            np.allclose(result["base_point"], [0.304, 0.002, 0.103])
+        )
 
     def test_weak_color_evidence_is_confirmed_across_matched_frames(self):
         config = GraspConfig()
@@ -240,6 +879,47 @@ class PlannerSafetyTests(unittest.TestCase):
         self.assertEqual(marker, 2)
         self.assertEqual(accumulated["color"], "red")
         self.assertEqual(accumulated["color_frames"], 2)
+
+    def test_scan_does_not_accumulate_irrelevant_strong_colours(self):
+        planner = GraspPlanner(NoopRobot(), GraspConfig(), threading.Event())
+        planner.wait_until_stationary = lambda: np.zeros(6)
+        planner.current_joint_position = lambda: np.zeros(6)
+        planner._accumulate_candidate_color = lambda *args, **kwargs: self.fail(
+            "irrelevant strong colours must not start multi-frame accumulation"
+        )
+
+        class Feed:
+            @staticmethod
+            def freshness_marker():
+                return 1
+
+            @staticmethod
+            def wait_for_newer(_marker, timeout):
+                return {
+                    "frame_seq": 2,
+                    "detections_timestamp": 2.0,
+                    "inference_latency_s": 0.01,
+                    "snapshot_age_s": 0.01,
+                    "detections": [
+                        {"color": "red", "color_confidence": 1.0},
+                        {"color": "yellow", "color_confidence": 1.0},
+                    ],
+                }
+
+        with patch(
+            "Panthera_lib.grasp_planner.get_base_camera_transform",
+            return_value=np.eye(4),
+        ):
+            result = planner._detect_at_pose(
+                Feed(),
+                intrinsic=object(),
+                tcp_camera=np.eye(4),
+                selected_color="green",
+                joint1=0.0,
+                label="TEST",
+            )
+
+        self.assertIsNone(result)
 
     def test_open_gripper_uses_current_positive_calibration(self):
         class GripperRobot:

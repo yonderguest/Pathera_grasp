@@ -28,10 +28,10 @@ class GraspConfig:
     camera_detection_interval: float = 0.02
     camera_detection_timeout: float = 3.0
     camera_performance_log_interval: float = 5.0
-    detection_stationary_velocity_tolerance: float = 0.05
-    detection_stationary_joint_tolerance: float = 0.005
+    detection_stationary_velocity_tolerance: float = 0.12
+    detection_stationary_joint_tolerance: float = 0.010
     detection_stationary_stable_samples: int = 3
-    detection_stationary_timeout: float = 2.0
+    detection_stationary_timeout: float = 3.0
     camera_serial: str = ""
     central_x_grasp_ratio: float = 0.80
 
@@ -70,16 +70,77 @@ class GraspConfig:
         default_factory=lambda: np.eye(3, dtype=float),
         repr=False,
     )
-    pre_grasp_offset_m: float = 0.05
-    pre_grasp_min_distance_m: float = 0.02
+    # Eye-in-hand observation move. Preserve the scan-camera orientation and
+    # correct only part of the measured image/range error so the target remains
+    # visible instead of jumping directly to the final grasp orientation.
+    observation_centering_gain: float = 0.50
+    observation_axial_gain: float = 0.50
+    observation_min_advance_m: float = 0.008
+    observation_max_advance_m: float = 0.025
+    observation_max_lateral_shift_m: float = 0.035
+    observation_max_translation_m: float = 0.045
+    observation_min_camera_distance_m: float = 0.12
+    observation_max_joint_step: float = 0.75
+
+    # Final approach standoff. Half of the current signed axial gap is used,
+    # then clamped so neither a tiny nor an excessively remote waypoint is
+    # generated. This is intentionally not half of the 3-D Euclidean distance.
+    pre_grasp_standoff_ratio: float = 0.50
+    pre_grasp_min_distance_m: float = 0.015
+    pre_grasp_max_distance_m: float = 0.040
     pre_grasp_lateral_tolerance_m: float = 0.015
     pre_grasp_orientation_tolerance_deg: float = 8.0
-    pre_grasp_realign_tolerance_m: float = 0.010
-    pre_grasp_abort_shift_m: float = 0.030
-    approach_path_lateral_tolerance_m: float = 0.005
+    # MoveJ only needs this tighter convergence at the final free-space
+    # waypoint.  The vendor default (0.05 rad) can leave 20--30 mm of TCP
+    # lateral error, which is too large for the following straight approach.
+    # 0.02 rad proved tighter than the real motor can repeat reliably and
+    # caused otherwise valid pre-grasp moves to time out.  The Cartesian
+    # realignment below handles the remaining TCP error explicitly.
+    pre_grasp_joint_tolerance_rad: float = 0.040
+    # If real feedback is still outside the straight-approach corridor, first
+    # retreat/re-align to the commanded standoff with a short Cartesian path.
+    pre_grasp_realign_max_translation_m: float = 0.045
+    pre_grasp_realign_max_orientation_deg: float = 12.0
+    pre_grasp_realign_endpoint_tolerance_m: float = 0.010
+    pre_grasp_realign_duration: float = 2.5
+    # Maximum deviation from the commanded start-to-target Cartesian segment.
+    # The separate pre-grasp gate still limits lateral error relative to the
+    # tool approach axis; do not use this value to reject a path merely because
+    # that path is converging from a small residual lateral offset.
+    approach_path_lateral_tolerance_m: float = 0.007
     approach_endpoint_tolerance_m: float = 0.015
     pre_grasp_duration: float = 3.0
     pre_grasp_camera_settle_time: float = 0.40
+    refine_frame_warmup: int = 3
+    refine_required_observations: int = 3
+    refine_max_frame_attempts: int = 8
+    refine_total_timeout_s: float = 4.0
+    refine_frame_timeout_s: float = 0.8
+    refine_target_match_radius_m: float = 0.050
+    # The observation move is deliberately capped and may not fully centre a
+    # far-edge target; Base-coordinate identity remains the primary gate.
+    refine_max_center_distance_px: float = 220.0
+    refine_fallback_min_area_px: int = 80
+    refine_fallback_max_area_px: int = 50000
+    refine_max_position_spread_m: float = 0.012
+    refine_max_xy_correction_m: float = 0.035
+    refine_max_z_correction_m: float = 0.020
+    refine_max_total_correction_m: float = 0.035
+    refine_max_approach_tilt_deg: float = 30.0
+    refine_max_open_axis_change_deg: float = 30.0
+    # One final, position-only visual correction at the collision-separated
+    # pre-grasp waypoint.  The close image may be magnified or partly occluded,
+    # so never recompute wrist orientation there and accept only a small,
+    # coherent, fully visible RGB-D correction.
+    close_refine_enabled: bool = True
+    close_refine_min_depth_m: float = 0.075
+    close_refine_border_margin_px: int = 6
+    close_refine_max_bbox_area_ratio: float = 0.30
+    close_refine_max_depth_spread_m: float = 0.015
+    close_refine_max_position_spread_m: float = 0.006
+    close_refine_max_xy_correction_m: float = 0.010
+    close_refine_max_z_correction_m: float = 0.008
+    close_refine_max_total_correction_m: float = 0.012
     graspnet_z_offset_m: float = -0.20
     graspnet_max_joint_jump: float = 2.6
     graspnet_scene_expand_px: int = 80
@@ -105,6 +166,7 @@ class GraspConfig:
     color_min_core_pixels: int = 20
     color_accumulation_min_frames: int = 2
     color_accumulation_max_frames: int = 5
+    color_accumulation_timeout_s: float = 1.0
     color_accumulation_min_samples: int = 80
     color_single_frame_strong_ratio: float = 0.60
     color_track_position_tolerance_m: float = 0.020
@@ -142,9 +204,20 @@ class GraspConfig:
             dtype=float,
         )
     )
+    # Residual physical correction after the calibrated Camera->TCP chain is
+    # composed explicitly.  The previous [0.150, 0.040, -0.070] m value also
+    # contained the HOME-pose projection of the missing 165 mm joint6->TCP
+    # transform ([0.1402, 0.0000, -0.0869] m); retaining both would double the
+    # tool offset and send the target outside the workspace.
     grasp_offset_base: np.ndarray = field(
-        default_factory=lambda: np.array([0.150, 0.040, -0.070], dtype=float)
+        default_factory=lambda: np.array([0.010, 0.040, 0.017], dtype=float)
     )
+    # Optional tool-axis overtravel.  A 5 mm trial moved visibly in the intended
+    # direction but enlarged the total miss because the tilted tool axis also
+    # introduced a large downward component.  Keep the mechanism available for
+    # future calibration, but disable it while close-range visual position
+    # refinement supplies the final correction.
+    grasp_approach_overtravel_m: float = 0.000
     approach_policy: str = "seeed_safe"
     max_dynamic_approach_tilt_deg: float = 25.0
     gripper_open_axis_offset_deg: float = 0.0
@@ -152,8 +225,16 @@ class GraspConfig:
     direct_grasp_duration: float = 5.0
     direct_grasp_post_command_wait: float = 1.0
     direct_grasp_settle_timeout: float = 4.0
+    direct_grasp_joint_tolerance_rad: float = 0.050
+    direct_grasp_tcp_tolerance_m: float = 0.012
     ik_position_tolerance_m: float = 0.03
     ik_rotation_tolerance_deg: float = 8.0
+    # The planner already supplies ordered seeds. Avoid starting another
+    # eight-seed search inside every outer seed attempt.
+    ik_single_seed_max_iterations: int = 600
+    ik_max_seed_attempts: int = 3
+    move_wait_min_timeout_s: float = 6.0
+    move_wait_margin_s: float = 4.0
     return_home_duration: float = 5.0
     put1_duration: float = 5.0
     put2_duration: float = 5.0
@@ -210,8 +291,21 @@ class GraspConfig:
     scan_step_duration: float = 2.0
     scan_camera_settle_time: float = 0.30
     scan_frame_warmup: int = 1
+    # Manual web jog is only accepted while the target prompt is idle. Positive
+    # J1 is defined as the operator's left arrow; negative J1 is right.
+    joint1_jog_step_rad: float = 0.5
+    joint1_jog_duration: float = 3.0
+    joint1_jog_posture_tolerance_rad: float = 0.20
 
     target_prompts: tuple[str, ...] = (
+        "toy building block",
+        "plastic building block",
+        "wooden block",
+        "Lego brick",
+    )
+    # These names are baked into the deployed block4 QNN context in this exact
+    # order. Changing them requires recompiling the context, not only Python.
+    npu_class_names: tuple[str, ...] = (
         "toy building block",
         "plastic building block",
         "wooden block",
@@ -240,6 +334,8 @@ class GraspConfig:
             raise ValueError("manual_grasp_rotation is not orthonormal")
         if not np.isclose(np.linalg.det(self.manual_grasp_rotation), 1.0, atol=2e-3):
             raise ValueError("manual_grasp_rotation must be right handed")
+        if not 0.0 <= self.grasp_approach_overtravel_m <= 0.015:
+            raise ValueError("grasp approach overtravel must be between 0 and 15 mm")
         if not np.allclose(
             self.graspnet_gripper_fix_rotation.T @ self.graspnet_gripper_fix_rotation,
             np.eye(3),
@@ -256,6 +352,12 @@ class GraspConfig:
             and self.scan_j1_step > 0.0
         ):
             raise ValueError("invalid J1 scan range or step")
+        if not (
+            0.0 < self.joint1_jog_step_rad <= self.joint_upper[0] - self.joint_lower[0]
+            and self.joint1_jog_duration > 0.0
+            and self.joint1_jog_posture_tolerance_rad > 0.0
+        ):
+            raise ValueError("invalid J1 web-jog settings")
         if self.scan_frame_warmup < 1:
             raise ValueError("scan_frame_warmup must be at least 1")
         color_ratios = (
@@ -272,23 +374,67 @@ class GraspConfig:
             1 <= self.color_accumulation_min_frames <= self.color_accumulation_max_frames
             and self.color_min_core_pixels > 0
             and self.color_accumulation_min_samples > 0
+            and self.color_accumulation_timeout_s > 0.0
             and self.color_track_position_tolerance_m > 0.0
         ):
             raise ValueError("invalid color accumulation settings")
         if not 12 < self.color_yellow_green_boundary < 85:
             raise ValueError("yellow/green hue boundary must be between 12 and 85")
         if (
-            self.pre_grasp_offset_m <= 0.0
-            or not 0.0 < self.pre_grasp_min_distance_m <= self.pre_grasp_offset_m
+            not 0.0 < self.observation_centering_gain <= 1.0
+            or not 0.0 < self.observation_axial_gain <= 1.0
+            or not 0.0 <= self.observation_min_advance_m <= self.observation_max_advance_m
+            or self.observation_max_lateral_shift_m <= 0.0
+            or self.observation_max_translation_m <= 0.0
+            or self.observation_min_camera_distance_m <= 0.0
+            or self.observation_max_joint_step <= 0.0
+            or not 0.0 < self.pre_grasp_standoff_ratio <= 1.0
+            or not 0.0 < self.pre_grasp_min_distance_m <= self.pre_grasp_max_distance_m
             or self.pre_grasp_lateral_tolerance_m <= 0.0
             or self.pre_grasp_orientation_tolerance_deg <= 0.0
-            or not 0.0 < self.pre_grasp_realign_tolerance_m < self.pre_grasp_abort_shift_m
+            or self.pre_grasp_joint_tolerance_rad <= 0.0
+            or self.pre_grasp_realign_max_translation_m <= 0.0
+            or self.pre_grasp_realign_max_orientation_deg
+            < self.pre_grasp_orientation_tolerance_deg
+            or self.pre_grasp_realign_endpoint_tolerance_m <= 0.0
+            or self.pre_grasp_realign_duration <= 0.0
             or self.approach_path_lateral_tolerance_m <= 0.0
             or self.approach_endpoint_tolerance_m <= 0.0
             or self.pre_grasp_duration <= 0.0
             or self.pre_grasp_camera_settle_time < 0.0
         ):
             raise ValueError("invalid pre-grasp settings")
+        if not (
+            2 <= self.refine_required_observations <= self.refine_max_frame_attempts
+            and self.refine_frame_warmup >= 1
+            and self.refine_total_timeout_s > 0.0
+            and 0.0 < self.refine_frame_timeout_s <= self.refine_total_timeout_s
+            and self.refine_target_match_radius_m > 0.0
+            and self.refine_max_center_distance_px > 0.0
+            and 0 < self.refine_fallback_min_area_px < self.refine_fallback_max_area_px
+            and 0.0 < self.refine_max_position_spread_m <= self.refine_target_match_radius_m
+            and 0.0 < self.refine_max_xy_correction_m <= self.refine_target_match_radius_m
+            and 0.0 < self.refine_max_z_correction_m <= self.refine_target_match_radius_m
+            and 0.0 < self.refine_max_total_correction_m <= self.refine_target_match_radius_m
+            and 0.0 < self.refine_max_approach_tilt_deg <= 45.0
+            and 0.0 < self.refine_max_open_axis_change_deg <= 45.0
+        ):
+            raise ValueError("invalid visual-refinement settings")
+        if not (
+            self.close_refine_min_depth_m >= 0.070
+            and self.close_refine_border_margin_px >= 0
+            and 0.0 < self.close_refine_max_bbox_area_ratio < 1.0
+            and self.close_refine_max_depth_spread_m > 0.0
+            and 0.0 < self.close_refine_max_position_spread_m
+            <= self.refine_max_position_spread_m
+            and 0.0 < self.close_refine_max_xy_correction_m
+            <= self.refine_max_xy_correction_m
+            and 0.0 < self.close_refine_max_z_correction_m
+            <= self.refine_max_z_correction_m
+            and 0.0 < self.close_refine_max_total_correction_m
+            <= self.refine_max_total_correction_m
+        ):
+            raise ValueError("invalid close-range refinement settings")
         if not (
             0.0 < self.depth_surface_percentile < 50.0
             and self.depth_surface_band_m > 0.0
@@ -307,6 +453,15 @@ class GraspConfig:
             raise ValueError("invalid camera timing or stationary settings")
         if self.zero_move_timeout <= 0.0:
             raise ValueError("zero_move_timeout must be positive")
+        if self.ik_single_seed_max_iterations < 50 or self.ik_max_seed_attempts < 1:
+            raise ValueError("invalid bounded IK settings")
+        if self.move_wait_min_timeout_s <= 0.0 or self.move_wait_margin_s <= 0.0:
+            raise ValueError("invalid bounded move timeout settings")
+        if (
+            self.direct_grasp_joint_tolerance_rad <= 0.0
+            or self.direct_grasp_tcp_tolerance_m <= 0.0
+        ):
+            raise ValueError("invalid direct-grasp settle tolerances")
         if (
             self.npu_response_timeout <= 0.0
             or self.npu_stderr_max_lines < 10
@@ -315,6 +470,8 @@ class GraspConfig:
             or self.npu_max_detections < 1
         ):
             raise ValueError("invalid NPU timeout or stderr history limit")
+        if not self.target_prompts or not self.npu_class_names:
+            raise ValueError("YOLOE prompt/class lists must not be empty")
 
 
 COLOR_ALIASES = {
