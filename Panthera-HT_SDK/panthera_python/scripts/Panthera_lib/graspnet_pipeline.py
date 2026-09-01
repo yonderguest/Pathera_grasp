@@ -264,12 +264,15 @@ class GraspNetCandidateProvider:
                 )
                 gg = gg[~collision_mask]
             except Exception as exc:
-                print(f"[GRASPNET] collision filter skipped: {exc!r}")
+                print(f"[GRASPNET] collision filter failed closed: {exc!r}")
+                return []
 
-        gg.nms(
+        gg = gg.nms(
             translation_thresh=self.config.graspnet_nms_translation,
             rotation_thresh=np.deg2rad(self.config.graspnet_nms_rotation),
         )
+        if gg is None:
+            raise RuntimeError("GraspNet NMS returned no candidate group")
         gg.sort_by_score()
 
         candidates = []
@@ -304,11 +307,15 @@ class GraspNetCandidateProvider:
 
             approach = tool_rotation[:, 0]
             manual_approach = self.config.manual_grasp_rotation[:, 0]
+            approach = approach / max(float(np.linalg.norm(approach)), 1e-12)
+            manual_approach = manual_approach / max(
+                float(np.linalg.norm(manual_approach)), 1e-12
+            )
             approach_angle = float(
                 np.degrees(
                     np.arccos(
                         np.clip(
-                            abs(float(np.dot(approach, manual_approach))),
+                            float(np.dot(approach, manual_approach)),
                             -1.0,
                             1.0,
                         )

@@ -90,6 +90,15 @@ def main():
         mask = (mask > 0).astype(np.uint8)
     else:
         mask = (depth > 0).astype(np.uint8)
+    ys, xs = np.where(mask > 0)
+    if xs.size == 0:
+        raise SystemExit("object mask contains no foreground pixels")
+    bbox = [
+        int(xs.min()),
+        int(ys.min()),
+        int(xs.max()) + 1,
+        int(ys.max()) + 1,
+    ]
 
     config = GraspConfig()
     config.project_root = PROJECT_ROOT
@@ -106,7 +115,7 @@ def main():
     candidates = provider.generate_candidates(
         color,
         depth,
-        {"mask": mask},
+        {"mask": mask, "bbox": bbox},
         intrinsic,
         depth_scale,
         base_camera,
@@ -123,4 +132,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

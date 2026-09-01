@@ -474,6 +474,23 @@ class Panthera(htr.Robot):  # 继承自htr.Robot
         # 获取当前位置
         current_pos = self.get_current_pos()
 
+        # 以配置限速为硬约束。若调用者给出的 duration 太短，自动延长，
+        # 不能把超速值直接交给不做限幅的 Joint_Pos_Vel。
+        if self.velocity_limits is not None:
+            velocity_limits = np.asarray(self.velocity_limits, dtype=float)
+            if np.any(velocity_limits <= 0.0):
+                raise ValueError("关节速度限幅必须全部大于0")
+            required_duration = float(
+                np.max(np.abs(pos - current_pos) / velocity_limits)
+            )
+            if required_duration > duration:
+                print(
+                    f"MoveJ duration {duration:.3f}s 低于限速所需 "
+                    f"{required_duration:.3f}s，已自动延长"
+                )
+                duration = required_duration
+                timeout = max(float(timeout), duration + 2.0)
+
         # 计算速度: v = (目标位置 - 当前位置) / 时间
         # 这样可以确保所有关节在duration时间内同时到达目标位置
         vel = (pos - current_pos) / duration
@@ -729,7 +746,7 @@ class Panthera(htr.Robot):  # 继承自htr.Robot
         参数:
             target_position: 目标位置 [x, y, z] (m)
             target_rotation: 目标旋转矩阵 3x3，如果为None则只考虑位置
-            init_q: 初始关节角度，如果为None则使用当前角度（multi_init=False时有效）
+            init_q: 首选初始关节角度；multi_init=True 时也会作为第一次尝试
             max_iter: 最大迭代次数
             eps: 收敛阈值（位置误差范数）
             damping: 阻尼系数 λ，用于避免雅可比矩阵奇异性
@@ -747,10 +764,11 @@ class Panthera(htr.Robot):  # 继承自htr.Robot
             自适应阻尼会根据误差大小动态调整阻尼系数
 
             当multi_init=True时，会尝试多个不同的初始关节配置：
+            - 调用者传入的 init_q（若有效）
             - 当前位置
             - 零位
             - 关节限位中点
-            - 随机配置（在关节限位范围内）
+            - 固定随机种子生成的配置（在关节限位范围内）
             返回第一个成功求解的结果，或最佳结果
         """
         if self.model is None:
@@ -760,7 +778,7 @@ class Panthera(htr.Robot):  # 继承自htr.Robot
         # 如果启用多初始值尝试
         if multi_init:
             return self._inverse_kinematics_dls_multi_init_impl(
-                target_position, target_rotation, num_attempts,
+                target_position, target_rotation, init_q, num_attempts,
                 max_iter, eps, damping, adaptive_damping
             )
 
@@ -885,37 +903,49 @@ class Panthera(htr.Robot):  # 继承自htr.Robot
         return None
 
     def _inverse_kinematics_dls_multi_init_impl(self, target_position, target_rotation,
-                                                num_attempts, max_iter, eps, damping, adaptive_damping):
+                                                init_q, num_attempts, max_iter, eps,
+                                                damping, adaptive_damping):
         """
         阻尼最小二乘法逆运动学求解的多初始值实现（内部函数）
         """
-        # 准备多个初始值
+        # 准备可复现的多个初始值。调用者 seed 必须排在第一位，不能被
+        # multi_init 分支静默丢弃。
         init_configs = []
 
-        # 1. 当前位置
-        init_configs.append(self.get_current_pos())
+        def append_unique(candidate):
+            candidate = np.asarray(candidate, dtype=float)
+            if candidate.shape != (self.motor_count,) or not np.all(np.isfinite(candidate)):
+                return
+            if not any(np.allclose(candidate, existing) for existing in init_configs):
+                init_configs.append(candidate.copy())
 
-        # 2. 零位
-        init_configs.append(np.zeros(self.motor_count))
+        if init_q is not None:
+            append_unique(init_q)
 
-        # 3. 中间位置（关节限位的中点）
+        # 当前位置仍是重要回退，但不再覆盖调用者 seed。
+        try:
+            append_unique(self.get_current_pos())
+        except Exception as exc:
+            print(f"读取当前关节角失败，跳过当前位姿 IK seed: {exc!r}")
+
+        append_unique(np.zeros(self.motor_count))
+
+        # 中间位置（关节限位的中点）
         if self.joint_limits is not None:
             mid_config = (self.joint_limits['lower'] + self.joint_limits['upper']) / 2
-            init_configs.append(mid_config)
+            append_unique(mid_config)
 
-        # 4. 随机配置（在关节限位范围内）
+        # 使用固定种子的补充配置，保证同一输入下求解顺序可复现。
+        rng = np.random.default_rng(0)
+        remaining = max(0, num_attempts - len(init_configs))
         if self.joint_limits is not None:
             lower = self.joint_limits['lower']
             upper = self.joint_limits['upper']
-
-            for _ in range(num_attempts - 3):
-                random_config = np.random.uniform(lower, upper)
-                init_configs.append(random_config)
+            for _ in range(remaining):
+                append_unique(rng.uniform(lower, upper))
         else:
-            # 如果没有限位信息，使用随机小角度
-            for _ in range(num_attempts - 3):
-                random_config = np.random.uniform(-np.pi/4, np.pi/4, self.motor_count)
-                init_configs.append(random_config)
+            for _ in range(remaining):
+                append_unique(rng.uniform(-np.pi/4, np.pi/4, self.motor_count))
 
         # 尝试每个初始值
         best_result = None
@@ -1665,6 +1695,55 @@ class Panthera(htr.Robot):  # 继承自htr.Robot
         if result is False:
             reason = "rejected or timed out" if wait else "rejected"
             raise RuntimeError(f"{label} move {reason}")
+        return True
+
+    def execute_joint_trajectory_checked(
+        self,
+        joint_trajectory,
+        duration,
+        max_torque,
+        label="Cartesian approach",
+    ):
+        """Execute a prevalidated joint path without spline deviation."""
+        trajectory = np.asarray(joint_trajectory, dtype=float)
+        if (
+            trajectory.ndim != 2
+            or trajectory.shape[0] < 2
+            or trajectory.shape[1] != self.motor_count
+            or not np.all(np.isfinite(trajectory))
+        ):
+            raise RuntimeError(f"{label} trajectory is invalid")
+        duration = float(duration)
+        if duration <= 0.0:
+            raise RuntimeError(f"{label} duration must be positive")
+
+        lower = np.asarray(self.joint_limits["lower"], dtype=float)
+        upper = np.asarray(self.joint_limits["upper"], dtype=float)
+        if np.any(trajectory < lower) or np.any(trajectory > upper):
+            raise RuntimeError(f"{label} trajectory exceeds joint limits")
+
+        dt = duration / (trajectory.shape[0] - 1)
+        segment_velocities = np.diff(trajectory, axis=0) / dt
+        velocity_limits = np.asarray(self.velocity_limits, dtype=float)
+        if np.any(np.abs(segment_velocities) > velocity_limits + 1e-6):
+            raise RuntimeError(f"{label} trajectory exceeds velocity limits")
+        if segment_velocities.shape[0] > 1:
+            acceleration = np.diff(segment_velocities, axis=0) / dt
+            acceleration_limits = np.asarray(self.acceleration_limits, dtype=float)
+            if np.any(np.abs(acceleration) > acceleration_limits + 1e-6):
+                raise RuntimeError(f"{label} trajectory exceeds acceleration limits")
+
+        timestamps = np.linspace(0.0, duration, trajectory.shape[0]).tolist()
+        velocities = np.vstack(
+            (segment_velocities, np.zeros((1, self.motor_count), dtype=float))
+        )
+        if not self._execute_trajectory(
+            trajectory.tolist(),
+            timestamps,
+            velocities.tolist(),
+            max_torque,
+        ):
+            raise RuntimeError(f"{label} execution failed")
         return True
 
     def hold_joints(self, joints, duration, max_torque):

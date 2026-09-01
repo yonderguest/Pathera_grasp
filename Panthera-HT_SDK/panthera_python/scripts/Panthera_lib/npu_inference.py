@@ -1,4 +1,4 @@
-"""Qualcomm QNN HTP NPU client for the brick-only YOLOE segmentation model.
+"""Qualcomm QNN HTP NPU client for the block-only YOLOE segmentation model.
 
 This module wraps the prebuilt ``npu_server`` binary.  The server loads the QNN
 context once and keeps running, while Python sends preprocessed 1x3x640x640
@@ -14,10 +14,12 @@ from __future__ import annotations
 
 import fcntl
 import os
+import select
 import struct
 import subprocess
 import threading
 import time
+from collections import deque
 from pathlib import Path
 
 import cv2
@@ -26,18 +28,16 @@ import numpy as np
 from .grasp_config import GraspConfig
 
 
-BRICK_NAMES = (
-    "red brick",
-    "orange brick",
-    "yellow brick",
-    "green brick",
-    "blue brick",
-    "pink brick",
+BLOCK_NAMES = (
+    "toy building block",
+    "plastic building block",
+    "wooden block",
+    "Lego brick",
 )
 
 
 class NpuYoloDetector:
-    """Persistent QNN HTP YOLOE detector for 6 brick classes."""
+    """Persistent QNN HTP YOLOE detector for four generic block prompts."""
 
     def __init__(self, config: GraspConfig, confidence: float = 0.30) -> None:
         project_root = Path(config.project_root)
@@ -48,7 +48,12 @@ class NpuYoloDetector:
         self.input_size = int(config.npu_input_size)
         self.in_bytes = 1 * 3 * self.input_size * self.input_size * 4
         self.confidence = float(confidence)
-        self.names = BRICK_NAMES
+        self.iou_threshold = float(config.npu_iou_threshold)
+        self.pre_nms_top_k = int(config.npu_pre_nms_top_k)
+        self.max_detections = int(config.npu_max_detections)
+        self.names = BLOCK_NAMES
+        self.response_timeout = float(config.npu_response_timeout)
+        self._io_lock = threading.Lock()
 
         self.fifo = f"/tmp/npu_resp_{os.getpid()}.fifo"
         try:
@@ -61,8 +66,14 @@ class NpuYoloDetector:
         fcntl.fcntl(self._rfd, fcntl.F_SETFL, flags & ~os.O_NONBLOCK)
 
         self.proc: subprocess.Popen | None = None
-        self.stderr_lines: list[str] = []
-        self._spawn()
+        self.stderr_lines: deque[str] = deque(maxlen=config.npu_stderr_max_lines)
+        self._stderr_thread: threading.Thread | None = None
+        self._healthy = True
+        try:
+            self._spawn()
+        except Exception:
+            self.close()
+            raise
 
     def _spawn(self) -> None:
         if not Path(self.server).is_file():
@@ -80,8 +91,13 @@ class NpuYoloDetector:
             stderr=subprocess.PIPE,
             env=env,
         )
-        self.stderr_lines = []
-        threading.Thread(target=self._drain_stderr, daemon=True).start()
+        self.stderr_lines.clear()
+        self._stderr_thread = threading.Thread(
+            target=self._drain_stderr,
+            name="npu-stderr",
+            daemon=False,
+        )
+        self._stderr_thread.start()
 
         deadline = time.time() + 30.0
         while time.time() < deadline:
@@ -95,19 +111,33 @@ class NpuYoloDetector:
         )
 
     def _drain_stderr(self) -> None:
-        assert self.proc is not None
-        for line in self.proc.stderr:
+        proc = self.proc
+        if proc is None or proc.stderr is None:
+            return
+        for line in proc.stderr:
             self.stderr_lines.append(line.decode(errors="replace"))
 
-    @staticmethod
-    def _read_exact(fd: int, size: int) -> bytes:
-        buf = b""
+    def _read_exact(self, fd: int, size: int) -> bytes:
+        buf = bytearray()
+        deadline = time.monotonic() + self.response_timeout
         while len(buf) < size:
+            if self.proc is None or self.proc.poll() is not None:
+                raise RuntimeError("npu_server exited while waiting for output")
+            remaining = deadline - time.monotonic()
+            if remaining <= 0.0:
+                raise TimeoutError(
+                    f"npu_server response timed out after {self.response_timeout:.1f}s"
+                )
+            readable, _, _ = select.select([fd], [], [], remaining)
+            if not readable:
+                raise TimeoutError(
+                    f"npu_server response timed out after {self.response_timeout:.1f}s"
+                )
             chunk = os.read(fd, size - len(buf))
             if not chunk:
                 raise RuntimeError("npu_server pipe closed")
-            buf += chunk
-        return buf
+            buf.extend(chunk)
+        return bytes(buf)
 
     @staticmethod
     def _letterbox(bgr: np.ndarray, input_size: int):
@@ -124,19 +154,69 @@ class NpuYoloDetector:
         return blob, height, width, ratio, dx, dy
 
     def infer(self, bgr: np.ndarray) -> list[dict]:
-        assert self.proc is not None
-        blob, height, width, ratio, dx, dy = self._letterbox(
-            bgr, self.input_size
-        )
-        self.proc.stdin.write(struct.pack("<I", self.in_bytes) + blob.tobytes())
-        self.proc.stdin.flush()
-
-        n_out = struct.unpack("<I", self._read_exact(self._rfd, 4))[0]
-        outs: list[bytes] = []
-        for _ in range(n_out):
-            size = struct.unpack("<I", self._read_exact(self._rfd, 4))[0]
-            outs.append(self._read_exact(self._rfd, size))
+        with self._io_lock:
+            if (
+                not self._healthy
+                or
+                self.proc is None
+                or self.proc.poll() is not None
+                or self.proc.stdin is None
+            ):
+                raise RuntimeError("npu_server is not healthy")
+            try:
+                blob, height, width, ratio, dx, dy = self._letterbox(
+                    bgr, self.input_size
+                )
+                self.proc.stdin.write(
+                    struct.pack("<I", self.in_bytes) + blob.tobytes()
+                )
+                self.proc.stdin.flush()
+                n_out = struct.unpack("<I", self._read_exact(self._rfd, 4))[0]
+                if n_out != 2:
+                    raise RuntimeError(f"unexpected npu_server output count: {n_out}")
+                outs: list[bytes] = []
+                for _ in range(n_out):
+                    size = struct.unpack("<I", self._read_exact(self._rfd, 4))[0]
+                    outs.append(self._read_exact(self._rfd, size))
+            except Exception as exc:
+                # The FIFO protocol has no request id.  Reusing it after any
+                # timeout/short read could pair a late response with a newer
+                # RGB-D frame, so poison and close this detector fail-closed.
+                self._healthy = False
+                self.close()
+                raise RuntimeError(
+                    "NPU transport failed; detector was closed to prevent cross-frame output"
+                ) from exc
         return self._decode(outs, height, width, ratio, dx, dy)
+
+    @staticmethod
+    def _nms_indices(boxes, scores, iou_threshold, pre_top_k, max_detections):
+        """Class-agnostic NMS before expensive prototype-mask decoding."""
+        boxes = np.asarray(boxes, dtype=np.float32)
+        scores = np.asarray(scores, dtype=np.float32)
+        order = np.argsort(scores)[::-1][: int(pre_top_k)]
+        kept: list[int] = []
+        while order.size and len(kept) < int(max_detections):
+            current = int(order[0])
+            kept.append(current)
+            if order.size == 1:
+                break
+            rest = order[1:]
+            x1 = np.maximum(boxes[current, 0], boxes[rest, 0])
+            y1 = np.maximum(boxes[current, 1], boxes[rest, 1])
+            x2 = np.minimum(boxes[current, 2], boxes[rest, 2])
+            y2 = np.minimum(boxes[current, 3], boxes[rest, 3])
+            intersection = np.maximum(0.0, x2 - x1) * np.maximum(0.0, y2 - y1)
+            area_current = max(
+                0.0,
+                float(boxes[current, 2] - boxes[current, 0]),
+            ) * max(0.0, float(boxes[current, 3] - boxes[current, 1]))
+            area_rest = np.maximum(0.0, boxes[rest, 2] - boxes[rest, 0]) * np.maximum(
+                0.0, boxes[rest, 3] - boxes[rest, 1]
+            )
+            union = np.maximum(area_current + area_rest - intersection, 1e-9)
+            order = rest[(intersection / union) <= float(iou_threshold)]
+        return kept
 
     def _decode(
         self,
@@ -154,8 +234,17 @@ class NpuYoloDetector:
         labels = pred[:, 5].astype(int)
         coeffs = pred[:, 6:38]
 
+        eligible = np.where(confidence >= self.confidence)[0]
+        selected = self._nms_indices(
+            boxes[eligible],
+            confidence[eligible],
+            self.iou_threshold,
+            self.pre_nms_top_k,
+            self.max_detections,
+        )
         detections: list[dict] = []
-        for index in np.where(confidence >= self.confidence)[0]:
+        for relative_index in selected:
+            index = int(eligible[relative_index])
             x1 = max(0.0, (boxes[index, 0] - dx) / ratio)
             y1 = max(0.0, (boxes[index, 1] - dy) / ratio)
             x2 = min(float(width), (boxes[index, 2] - dx) / ratio)
@@ -192,16 +281,26 @@ class NpuYoloDetector:
         return detections
 
     def close(self) -> None:
-        if self.proc is not None:
+        proc = self.proc
+        if proc is not None:
             try:
-                self.proc.stdin.close()
+                if proc.stdin is not None:
+                    proc.stdin.close()
             except Exception:
                 pass
             try:
-                self.proc.terminate()
+                proc.terminate()
+                proc.wait(timeout=2.0)
             except Exception:
-                pass
+                try:
+                    proc.kill()
+                    proc.wait(timeout=2.0)
+                except Exception:
+                    pass
             self.proc = None
+        if self._stderr_thread is not None:
+            self._stderr_thread.join(timeout=2.0)
+            self._stderr_thread = None
         try:
             os.close(self._rfd)
         except OSError:
@@ -210,4 +309,3 @@ class NpuYoloDetector:
             os.unlink(self.fifo)
         except OSError:
             pass
-

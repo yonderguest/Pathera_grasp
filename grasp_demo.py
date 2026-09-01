@@ -3,13 +3,16 @@
 """Panthera-HT coloured building-block visual grasp.
 
 Workflow:
-    select colour -> scan J1 -> detect -> plan -> direct grasp -> place -> ZERO
+    select colour -> scan J1 -> detect -> 5 cm pre-grasp -> re-detect
+    -> final grasp -> place -> ZERO
 """
 
 import os
+import select
 import signal
 import sys
 import threading
+import time
 from pathlib import Path
 
 import numpy as np
@@ -66,24 +69,65 @@ def safe_print(*args, **kwargs):
 
 def on_signal(signum, _frame):
     shutdown_requested.set()
-    safe_print(f"\n[SIGNAL] {signum} received; returning to ZERO.")
+    safe_print(f"\n[SIGNAL] {signum} received; returning to startup pose.")
+
+
+def on_web_stop_requested():
+    """Request a graceful stop whose final destination is the startup pose."""
+    shutdown_requested.set()
+    safe_print("\n[WEB] end requested; returning to startup pose before motor stop.")
 
 
 signal.signal(signal.SIGINT, on_signal)
 signal.signal(signal.SIGTERM, on_signal)
 
 
-def choose_target_at_start(voice=None):
+def read_terminal_command(streamer=None) -> str | None:
+    """Read one terminal or browser command while remaining interruptible."""
+    safe_print("> ", end="")
+    terminal_available = bool(sys.stdin.isatty())
+    while not shutdown_requested.is_set():
+        if streamer is not None:
+            command = streamer.poll_target_command()
+            if command is not None:
+                safe_print(f"\n[WEB] 收到网页目标：{command}")
+                return command
+            if streamer.is_closed and not terminal_available:
+                return None
+        if not terminal_available:
+            time.sleep(0.2)
+            continue
+        try:
+            readable, _, _ = select.select([sys.stdin], [], [], 0.2)
+        except (OSError, ValueError):
+            return None
+        if readable:
+            line = sys.stdin.readline()
+            return line if line else None
+    return None
+
+
+def choose_target_at_start(voice=None, streamer=None):
+    def finish(value):
+        if streamer is not None:
+            streamer.set_accepting_targets(False)
+        return value
+
     safe_print(
         "\n您想要抓取什么？（例如：红色积木 / 黄色积木 / 蓝色积木，q 退出）"
     )
+    if streamer is not None:
+        streamer.set_accepting_targets(True)
+        streamer.set_control_message(
+            "请选择目标颜色并确认现场安全；提交后机械臂会自动开始扫描。"
+        )
     if voice is not None and voice.available:
         voice.say("请说出要抓取的颜色，例如红色积木")
         command = voice.listen_for_command()
         if command:
             command = command.strip()
             if command.lower() == "q":
-                return False
+                return finish(False)
             color, accepted = parse_target_command(command)
             if accepted:
                 selected = color if color is not None else "任意颜色"
@@ -91,18 +135,22 @@ def choose_target_at_start(voice=None):
                     f"[TARGET] 语音识别：已选择 {selected} 积木；检测到可抓取目标后自动执行一次抓取。"
                 )
                 voice.say(f"已选择{selected}积木")
-                return color
+                return finish(color)
             safe_print(
                 f"[VOICE] 未能从语音识别颜色：{command!r}，请继续用终端输入。"
             )
     while not shutdown_requested.is_set():
         try:
-            command = input("> ")
-        except EOFError:
-            return False
+            command = read_terminal_command(streamer)
+        except (EOFError, KeyboardInterrupt):
+            return finish(False)
+        if command is None:
+            return finish(False)
         command = command.strip()
         if command.lower() == "q":
-            return False
+            if streamer is not None:
+                streamer.set_control_message("收到安全退出命令。")
+            return finish(False)
         color, accepted = parse_target_command(command)
         if accepted:
             selected = color if color is not None else "任意颜色"
@@ -111,9 +159,15 @@ def choose_target_at_start(voice=None):
             )
             if voice is not None:
                 voice.say(f"已选择{selected}积木")
-            return color
+            if streamer is not None:
+                streamer.set_control_message(f"目标有效：{selected}积木。")
+            return finish(color)
+        if streamer is not None:
+            streamer.set_control_message(
+                f"无法识别“{command}”，请输入红/黄/蓝/绿/白/黑或任意颜色。"
+            )
         safe_print("未识别颜色，请输入红/黄/蓝/绿/白/黑积木，或 q 退出。")
-    return False
+    return finish(False)
 
 
 def build_config():
@@ -129,16 +183,17 @@ def build_config():
     config.use_graspnet = False
     if os.environ.get("GRASPNET_USE", "0") == "1":
         config.use_graspnet = True
-    config.use_npu = os.environ.get("YOLO_NPU", "0") == "1"
+    config.use_npu = os.environ.get("YOLO_NPU", "1") == "1"
     config.graspnet_checkpoint_path = os.environ.get(
         "GRASPNET_CHECKPOINT_PATH", config.graspnet_checkpoint_path
     )
     config.stream_host = os.environ.get("VISION_STREAM_HOST", "0.0.0.0")
     config.stream_port = int(os.environ.get("VISION_STREAM_PORT", "8080"))
     config.stream_jpeg_quality = int(
-        os.environ.get("VISION_STREAM_JPEG_QUALITY", "85")
+        os.environ.get("VISION_STREAM_JPEG_QUALITY", "92")
     )
-    voice_input_flag = os.environ.get("VOICE_INPUT", "1").strip().lower()
+    config.camera_serial = os.environ.get("REALSENSE_SERIAL", "").strip()
+    voice_input_flag = os.environ.get("VOICE_INPUT", "0").strip().lower()
     config.use_voice = voice_input_flag not in {"0", "false", "no", "off"}
     config.voice_asr_model_dir = os.environ.get(
         "IQ9075_ASR_MODEL_DIR",
@@ -156,14 +211,16 @@ def build_config():
 
 
 def main():
+    exit_code = 0
     robot = None
+    planner = None
     pipeline = None
     streamer = None
     camera_feed = None
     npu_detector = None
     voice = None
+    startup_joint_position = None
     config = build_config()
-    last_command = config.zero.copy()
     try:
         safe_print("=" * 68)
         safe_print("Panthera-HT coloured building-block visual grasp")
@@ -173,6 +230,7 @@ def main():
             config.stream_host,
             config.stream_port,
             config.stream_jpeg_quality,
+            stop_callback=on_web_stop_requested,
         )
         if not streamer.start():
             streamer = None
@@ -187,11 +245,45 @@ def main():
             depth_scale,
             streamer=streamer,
             model=None,
+            intrinsic=intrinsic,
         )
         camera_feed.start()
         safe_print("[VISION] camera preview started.")
 
+        # Load the selected vision backend before taking ownership of or
+        # moving the arm.  Backend startup failures therefore remain motion-free.
+        tcp_camera = load_hand_eye(config)
+        if config.use_npu:
+            safe_print("[VISION] selected backend: Qualcomm QNN HTP NPU")
+            npu_detector = NpuYoloDetector(
+                config, confidence=config.npu_confidence_threshold
+            )
+            camera_feed.set_npu_detector(npu_detector)
+            safe_print("[VISION] YOLOE NPU detector ready.")
+        else:
+            safe_print("[VISION] selected backend: CPU YOLOE (slow fallback)")
+            model = load_target_model(config)
+            camera_feed.set_model(model)
+            safe_print("[VISION] YOLOE CPU model loaded.")
+
         robot = Panthera(config.robot_config)
+        startup_joint_position = np.asarray(
+            robot.current_joint_position(),
+            dtype=float,
+        )
+        if (
+            startup_joint_position.shape != (6,)
+            or not np.all(np.isfinite(startup_joint_position))
+            or np.any(startup_joint_position < config.joint_lower)
+            or np.any(startup_joint_position > config.joint_upper)
+        ):
+            raise RuntimeError(
+                f"invalid startup joint position: {startup_joint_position!r}"
+            )
+        safe_print(
+            "[INIT] captured pre-program startup pose: "
+            f"{np.round(startup_joint_position, 4)}"
+        )
         if config.use_voice:
             voice = VoiceInterface(
                 config.project_root,
@@ -204,48 +296,37 @@ def main():
                 safe_print("[VOICE] voice interface ready (offline ASR + TTS).")
             else:
                 safe_print("[VOICE] voice interface unavailable; using terminal input.")
+        planner = GraspPlanner(
+            robot,
+            config,
+            shutdown_requested,
+            graspnet_provider=None,
+            voice=voice,
+        )
         graspnet_provider = None
         if config.use_graspnet:
             safe_print("[GRASPNET] loading GraspNet candidate provider ...")
             graspnet_provider = GraspNetCandidateProvider(config)
             graspnet_provider.load()
+            planner.graspnet_provider = graspnet_provider
             safe_print("[GRASPNET] GraspNet candidate provider loaded.")
-        planner = GraspPlanner(
-            robot,
-            config,
-            shutdown_requested,
-            graspnet_provider=graspnet_provider,
-            voice=voice,
-        )
 
         planner.home()
-        last_command = config.home.copy()
         safe_print("[INIT] opening gripper at HOME ...")
         planner.open_gripper()
-
-        tcp_camera = load_hand_eye(config)
-        if config.use_npu:
-            npu_detector = NpuYoloDetector(
-                config, confidence=config.npu_confidence_threshold
-            )
-            camera_feed.set_npu_detector(npu_detector)
-            safe_print("[VISION] YOLOE NPU detector ready.")
-        else:
-            model = load_target_model(config)
-            camera_feed.set_model(model)
-            safe_print("[VISION] YOLOE model loaded.")
 
         task_complete = planner.run_grasp_loop(
             camera_feed,
             intrinsic,
             tcp_camera,
             streamer,
-            lambda: choose_target_at_start(voice),
+            lambda: choose_target_at_start(voice, streamer),
         )
         if task_complete:
             safe_print("[GRASP] scan, grasp and placement completed; returning to ZERO.")
     except Exception as exc:
         safe_print(f"[MAIN] exception: {exc!r}")
+        exit_code = 1
     finally:
         if camera_feed is not None:
             camera_feed.stop()
@@ -255,8 +336,13 @@ def main():
             safe_print("[STREAM] closing web preview ...")
             streamer.stop()
             safe_print("[STREAM] web preview closed.")
-        if "planner" in locals():
-            planner.safe_shutdown(pipeline, last_command)
+        if planner is not None:
+            if not planner.safe_shutdown(
+                pipeline,
+                shutdown_target=startup_joint_position,
+                shutdown_label="STARTUP POSE",
+            ):
+                exit_code = max(exit_code, 2)
         elif pipeline is not None:
             try:
                 pipeline.stop()
@@ -264,7 +350,8 @@ def main():
                 pass
         if voice is not None:
             voice.close()
+    return exit_code
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

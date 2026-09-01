@@ -6,17 +6,30 @@ import contextlib
 import signal
 import threading
 import time
+from enum import Enum
 
 import numpy as np
 
 from .grasp_config import GraspConfig
 from .vision_pipeline import (
+    apply_accumulated_color,
     get_base_camera_transform,
     grasp_geometry,
     grasp_rotation_from_mask,
     object_base_position,
     workspace_ok,
 )
+
+
+class RobotLifecycleState(str, Enum):
+    """Finite lifecycle for the process that owns the physical robot."""
+
+    OWNED = "owned"
+    HOMED = "homed"
+    ACTIVE = "active"
+    STOPPING = "stopping"
+    FAULT_HOLD = "fault_hold"
+    STOPPED = "stopped"
 
 
 class GraspPlanner:
@@ -35,6 +48,24 @@ class GraspPlanner:
         self.interrupted = interrupt_event
         self.graspnet_provider = graspnet_provider
         self.voice = voice
+        self.lifecycle_state = RobotLifecycleState.OWNED
+        self._last_command: np.ndarray | None = None
+        self._shutdown_lock = threading.Lock()
+        self._shutdown_complete = False
+        self._shutdown_succeeded = False
+
+    @property
+    def last_command(self):
+        """Return the most recently accepted six-axis position command."""
+        if self._last_command is None:
+            return None
+        return self._last_command.copy()
+
+    def _remember_command(self, joints) -> None:
+        command = np.asarray(joints, dtype=float)
+        if command.shape != (6,) or not np.all(np.isfinite(command)):
+            raise ValueError("joint command must contain six finite values")
+        self._last_command = command.copy()
 
     def _say(self, text: str) -> None:
         """Speak a status message when a voice interface is available."""
@@ -78,15 +109,23 @@ class GraspPlanner:
                 num_attempts=8,
             )
         if joints is None:
+            print("[IK] solver returned no solution for this seed.")
             return None
         joints = np.asarray(joints, dtype=float)
-        if (
-            joints.shape != (6,)
-            or not np.all(np.isfinite(joints))
-            or np.any(joints < self.config.joint_lower)
-            or np.any(joints > self.config.joint_upper)
-            or np.max(np.abs(joints - seed)) > jump_limit
+        if joints.shape != (6,) or not np.all(np.isfinite(joints)):
+            print(f"[IK] rejected malformed solution: {joints!r}")
+            return None
+        if np.any(joints < self.config.joint_lower) or np.any(
+            joints > self.config.joint_upper
         ):
+            print(f"[IK] rejected joint-limit violation: q={np.round(joints, 3)}")
+            return None
+        joint_jump = float(np.max(np.abs(joints - seed)))
+        if joint_jump > jump_limit:
+            print(
+                f"[IK] rejected branch jump={joint_jump:.3f} rad "
+                f"(limit={jump_limit:.3f})."
+            )
             return None
 
         with self.sdk_call():
@@ -121,6 +160,33 @@ class GraspPlanner:
             return None
         return joints
 
+    def validate_candidate(
+        self,
+        tool_target,
+        joint6_target,
+        tool_rotation,
+        seeds,
+        jump_limit,
+        label="candidate",
+    ):
+        """Apply the same workspace and IK policy to every grasp backend."""
+        tool_target = np.asarray(tool_target, dtype=float)
+        joint6_target = np.asarray(joint6_target, dtype=float)
+        tool_rotation = np.asarray(tool_rotation, dtype=float)
+        if not workspace_ok(tool_target, joint6_target, self.config):
+            print(f"[PLAN] {label} rejected by workspace limits.")
+            return None
+        for seed in seeds:
+            solution = self.solve_ik(
+                joint6_target,
+                tool_rotation,
+                np.asarray(seed, dtype=float),
+                jump_limit,
+            )
+            if solution is not None:
+                return solution
+        return None
+
     def plan_grasp(self, joint6_target, tool_rotation):
         current = self.current_joint_position()
         final = self.solve_ik(
@@ -144,14 +210,24 @@ class GraspPlanner:
         return final
 
     def move_j(self, joints, duration, label, wait=True):
+        joints = np.asarray(joints, dtype=float)
         with self.sdk_call():
-            self.robot.move_j_checked(
+            result = self.robot.move_j_checked(
                 joints,
                 duration=duration,
                 max_torque=self.config.max_torque,
                 label=label,
                 wait=wait,
             )
+        if result is False:
+            raise RuntimeError(f"{label} move failed")
+        self._remember_command(joints)
+        if self.lifecycle_state not in {
+            RobotLifecycleState.STOPPING,
+            RobotLifecycleState.FAULT_HOLD,
+            RobotLifecycleState.STOPPED,
+        }:
+            self.lifecycle_state = RobotLifecycleState.ACTIVE
 
     def home(self):
         with self.sdk_call():
@@ -163,6 +239,8 @@ class GraspPlanner:
             )
         if result is False:
             raise RuntimeError("HOME move failed")
+        self._remember_command(self.config.home)
+        self.lifecycle_state = RobotLifecycleState.HOMED
         self._say("机械臂已回到初始位置")
 
     def open_gripper(self):
@@ -183,6 +261,10 @@ class GraspPlanner:
             with self.sdk_call():
                 last_position, _ = self.robot.gripper_state()
             if abs(last_position - cfg.gripper_open_position) <= cfg.gripper_open_position_tolerance:
+                print(
+                    f"[GRIPPER] open confirmed: actual={last_position:+.3f}, "
+                    f"target={cfg.gripper_open_position:+.3f}"
+                )
                 return True
             time.sleep(0.05)
         raise RuntimeError(
@@ -277,56 +359,255 @@ class GraspPlanner:
         )
         return False
 
-    def plan_graspnet_pre_grasp(self, found):
-        """Plan an approach waypoint just before the GraspNet grasp pose."""
+    @staticmethod
+    def rotation_error_deg(first, second):
+        first = np.asarray(first, dtype=float)
+        second = np.asarray(second, dtype=float)
+        return float(
+            np.degrees(
+                np.arccos(
+                    np.clip((float(np.trace(first.T @ second)) - 1.0) / 2.0, -1.0, 1.0)
+                )
+            )
+        )
+
+    def current_tool_pose(self, joints):
+        """Return the configured gripper-tip pose for explicit joints."""
+        with self.sdk_call():
+            fk = self.robot.forward_kinematics(np.asarray(joints, dtype=float))
+        if fk is None:
+            raise RuntimeError("forward kinematics failed for pre-grasp")
+        rotation = np.asarray(fk["rotation"], dtype=float)
+        joint6_position = np.asarray(fk["position"], dtype=float)
+        if rotation.shape != (3, 3) or joint6_position.shape != (3,):
+            raise RuntimeError("invalid forward-kinematics result for pre-grasp")
+        return joint6_position + rotation @ self.config.tcp_in_joint6, rotation
+
+    def current_tool_position(self, joints):
+        return self.current_tool_pose(joints)[0]
+
+    def wait_until_stationary(self):
+        """Return a stable joint sample, or None when the arm is still moving."""
+        cfg = self.config
+        deadline = time.monotonic() + cfg.detection_stationary_timeout
+        stable = 0
+        latest = None
+        while time.monotonic() < deadline and not self.interrupted.is_set():
+            with self.sdk_call():
+                latest = np.asarray(self.robot.current_joint_position(), dtype=float)
+                velocity = np.asarray(self.robot.get_current_vel(), dtype=float)
+            if (
+                latest.shape != (6,)
+                or velocity.shape != (6,)
+                or not np.all(np.isfinite(latest))
+                or not np.all(np.isfinite(velocity))
+            ):
+                raise RuntimeError("invalid joint feedback while waiting for camera stability")
+            if float(np.max(np.abs(velocity))) <= cfg.detection_stationary_velocity_tolerance:
+                stable += 1
+                if stable >= cfg.detection_stationary_stable_samples:
+                    return latest
+            else:
+                stable = 0
+            time.sleep(0.05)
+        print("[VISION] arm did not become stationary before RGB-D capture.")
+        return None
+
+    def pre_grasp_alignment(self, found, current_joints=None):
+        """Measure signed approach travel, lateral error and orientation error."""
+        if current_joints is None:
+            current_joints = self.current_joint_position()
+        current_tool, current_rotation = self.current_tool_pose(current_joints)
+        tool_target = np.asarray(found["tool_target"], dtype=float)
+        tool_rotation = np.asarray(found["tool_rotation"], dtype=float)
+        approach = np.asarray(tool_rotation[:, 0], dtype=float)
+        approach /= float(np.linalg.norm(approach))
+        delta = tool_target - current_tool
+        axial = float(np.dot(delta, approach))
+        lateral = float(np.linalg.norm(delta - axial * approach))
+        orientation = self.rotation_error_deg(current_rotation, tool_rotation)
+        return axial, lateral, orientation, current_tool, approach
+
+    def plan_pre_grasp(self, found):
+        """Plan a waypoint 5 cm behind the compensated final grasp pose."""
         cfg = self.config
         tool_target = np.asarray(found["tool_target"], dtype=float)
         tool_rotation = np.asarray(found["tool_rotation"], dtype=float)
-        approach = tool_rotation[:, 0]
-        pre_tool_target = tool_target - cfg.graspnet_pre_grasp_offset * approach
+        approach = np.asarray(tool_rotation[:, 0], dtype=float)
+        approach_norm = float(np.linalg.norm(approach))
+        if approach_norm < 1e-8:
+            raise RuntimeError("pre-grasp approach direction has zero length")
+        approach /= approach_norm
+
+        current_joints = self.current_joint_position()
+        axial, lateral, orientation, _current_tool, _approach = self.pre_grasp_alignment(
+            found, current_joints
+        )
+        if (
+            cfg.pre_grasp_min_distance_m <= axial <= cfg.pre_grasp_offset_m
+            and lateral <= cfg.pre_grasp_lateral_tolerance_m
+            and orientation <= cfg.pre_grasp_orientation_tolerance_deg
+        ):
+            print(
+                f"[PREGRASP] already inside approach corridor: axial={axial:.3f} m, "
+                f"lateral={lateral:.3f} m, rotation={orientation:.2f} deg; "
+                "skipping the free-space waypoint."
+            )
+            return None
+        if (
+            axial < cfg.pre_grasp_min_distance_m
+            and lateral <= cfg.pre_grasp_lateral_tolerance_m
+        ):
+            raise RuntimeError(
+                f"tip is too close to or beyond the grasp plane: axial={axial:.3f} m"
+            )
+
+        pre_tool_target = tool_target - cfg.pre_grasp_offset_m * approach
         tcp_offset = tool_rotation @ cfg.tcp_in_joint6
         pre_joint6_target = pre_tool_target - tcp_offset
-        seed = found.get("provisional_joints", cfg.manual_grasp_ik_seed)
-        return self.solve_ik(
+        seed = np.asarray(found.get("provisional_joints", current_joints), dtype=float)
+        jump_limit = (
+            cfg.graspnet_max_joint_jump if cfg.use_graspnet else cfg.max_home_to_grasp_step
+        )
+        planned = self.validate_candidate(
+            pre_tool_target,
             pre_joint6_target,
             tool_rotation,
-            np.asarray(seed, dtype=float),
-            cfg.graspnet_max_joint_jump,
+            (current_joints, seed, cfg.manual_grasp_ik_seed),
+            jump_limit,
+            label="pre-grasp",
         )
+        if planned is None:
+            raise RuntimeError("pre-grasp validation failed; direct fallback is unsafe")
+        print(
+            f"[PREGRASP] planned tip waypoint {cfg.pre_grasp_offset_m:.3f} m "
+            f"before final grasp: {np.round(pre_tool_target, 3)}"
+        )
+        return planned
 
-    def grasp_and_close(self, final, streamer=None, pre_grasp_joints=None):
+    def plan_cartesian_approach(self, found):
+        """Plan and validate the final straight TCP approach sample by sample."""
+        cfg = self.config
+        current = self.wait_until_stationary()
+        if current is None:
+            raise RuntimeError("arm is not stationary before Cartesian approach")
+        axial, lateral, orientation, start_tool, approach = self.pre_grasp_alignment(
+            found, current
+        )
+        if not (
+            cfg.pre_grasp_min_distance_m <= axial <= cfg.pre_grasp_offset_m + 0.005
+            and lateral <= cfg.pre_grasp_lateral_tolerance_m
+            and orientation <= cfg.pre_grasp_orientation_tolerance_deg
+        ):
+            raise RuntimeError(
+                "final approach does not start inside the pre-grasp corridor: "
+                f"axial={axial:.3f} m, lateral={lateral:.3f} m, "
+                f"rotation={orientation:.2f} deg"
+            )
+
+        with self.sdk_call():
+            fk = self.robot.forward_kinematics(current)
+        if fk is None:
+            raise RuntimeError("FK failed before Cartesian approach")
+        start_pose = {
+            "position": np.asarray(fk["position"], dtype=float),
+            "rotation": np.asarray(fk["rotation"], dtype=float),
+        }
+        end_pose = {
+            "position": np.asarray(found["joint6_target"], dtype=float),
+            "rotation": np.asarray(found["tool_rotation"], dtype=float),
+        }
+        with self.sdk_call():
+            planned, fraction = self.robot.compute_cartesian_path(
+                [start_pose, end_pose], avoid_collisions=False
+            )
+        if planned is None or float(fraction) < 0.999999:
+            raise RuntimeError(
+                f"Cartesian approach planning incomplete: fraction={float(fraction):.3f}"
+            )
+        trajectory = [np.asarray(current, dtype=float)] + [
+            np.asarray(joints, dtype=float) for joints in planned
+        ]
+        if len(trajectory) < 2:
+            raise RuntimeError("Cartesian approach contains no motion samples")
+
+        previous_progress = -1e-6
+        previous_joints = trajectory[0]
+        jump_limit = float(getattr(self.robot, "jump_threshold", 1.5))
+        for index, joints in enumerate(trajectory):
+            if (
+                joints.shape != (6,)
+                or not np.all(np.isfinite(joints))
+                or np.any(joints < cfg.joint_lower)
+                or np.any(joints > cfg.joint_upper)
+            ):
+                raise RuntimeError(f"Cartesian sample {index} violates joint limits")
+            if index and float(np.max(np.abs(joints - previous_joints))) > jump_limit:
+                raise RuntimeError(f"Cartesian sample {index} has a joint jump")
+            with self.sdk_call():
+                sample_fk = self.robot.forward_kinematics(joints)
+            if sample_fk is None:
+                raise RuntimeError(f"FK failed at Cartesian sample {index}")
+            rotation = np.asarray(sample_fk["rotation"], dtype=float)
+            joint6 = np.asarray(sample_fk["position"], dtype=float)
+            tool = joint6 + rotation @ cfg.tcp_in_joint6
+            if not workspace_ok(tool, joint6, cfg):
+                raise RuntimeError(f"Cartesian sample {index} leaves the workspace")
+            progress = float(np.dot(tool - start_tool, approach))
+            cross_track = float(
+                np.linalg.norm((tool - start_tool) - progress * approach)
+            )
+            if progress + 1e-4 < previous_progress or progress > axial + 0.001:
+                raise RuntimeError(f"Cartesian sample {index} is not axially monotonic")
+            if cross_track > cfg.approach_path_lateral_tolerance_m:
+                raise RuntimeError(
+                    f"Cartesian sample {index} cross-track error={cross_track:.4f} m"
+                )
+            if self.rotation_error_deg(rotation, end_pose["rotation"]) > (
+                cfg.pre_grasp_orientation_tolerance_deg
+            ):
+                raise RuntimeError(f"Cartesian sample {index} rotates outside tolerance")
+            previous_progress = progress
+            previous_joints = joints
+
+        endpoint_tool, endpoint_rotation = self.current_tool_pose(trajectory[-1])
+        endpoint_error = float(
+            np.linalg.norm(endpoint_tool - np.asarray(found["tool_target"], dtype=float))
+        )
+        if endpoint_error > cfg.approach_endpoint_tolerance_m:
+            raise RuntimeError(
+                f"Cartesian endpoint error={endpoint_error:.4f} m exceeds tolerance"
+            )
+        if self.rotation_error_deg(endpoint_rotation, end_pose["rotation"]) > (
+            cfg.pre_grasp_orientation_tolerance_deg
+        ):
+            raise RuntimeError("Cartesian endpoint orientation is inaccurate")
+        print(
+            f"[PREGRASP] Cartesian approach verified: travel={axial:.3f} m, "
+            f"samples={len(trajectory)}, endpoint_error={endpoint_error:.4f} m"
+        )
+        return trajectory
+
+    def execute_cartesian_approach(self, trajectory):
+        with self.sdk_call():
+            self.robot.execute_joint_trajectory_checked(
+                trajectory,
+                duration=self.config.direct_grasp_duration,
+                max_torque=self.config.max_torque,
+                label="FINAL CARTESIAN APPROACH",
+            )
+        self._remember_command(trajectory[-1])
+
+    def grasp_and_close(self, final, approach_trajectory, streamer=None):
         cfg = self.config
         print("[GRASP] opening gripper before direct grasp ...")
         self.open_gripper()
         if self.interrupted.is_set():
             return False, float("nan"), float("nan")
 
-        if pre_grasp_joints is not None:
-            pre_grasp_joints = np.asarray(pre_grasp_joints, dtype=float)
-            print("[GRASP] moving to pre-grasp waypoint ...")
-            self.move_j(
-                pre_grasp_joints,
-                cfg.direct_grasp_duration,
-                "PRE GRASP",
-                wait=False,
-            )
-            if not self.sleep_interruptible(
-                cfg.direct_grasp_duration + cfg.direct_grasp_post_command_wait
-            ):
-                return False, float("nan"), float("nan")
-            self.settle_at_grasp(
-                pre_grasp_joints,
-                duration=cfg.direct_grasp_settle_timeout,
-                pos_tol=0.015,
-                vel_tol=0.2,
-            )
-
-        print("[GRASP] moving directly HOME -> grasp pose ...")
-        self.move_j(final, cfg.direct_grasp_duration, "DIRECT GRASP", wait=False)
-        print("[GRASP] direct command sent; waiting for motion ...")
-        if not self.sleep_interruptible(
-            cfg.direct_grasp_duration + cfg.direct_grasp_post_command_wait
-        ):
+        print("[GRASP] executing validated Cartesian final approach ...")
+        self.execute_cartesian_approach(approach_trajectory)
+        if not self.sleep_interruptible(cfg.direct_grasp_post_command_wait):
             return False, float("nan"), float("nan")
 
         actual = self.current_joint_position()
@@ -344,8 +625,7 @@ class GraspPlanner:
             vel_tol=0.2,
         )
         if not settled:
-            print("[GRASP] strict settle timed out; holding final command before closing.")
-            self.hold_arm(final, 0.5)
+            raise RuntimeError("final grasp pose did not settle; gripper close aborted")
 
         print("[GRASP] closing gripper while holding arm ...")
         grasp_hold = self.current_joint_position()
@@ -413,8 +693,10 @@ class GraspPlanner:
         self.move_j(cfg.put2, cfg.put2_duration, "PUT2")
         return True
 
-    def execute_grasp(self, final, streamer=None):
-        clamped, _gpos, _gtor = self.grasp_and_close(final, streamer)
+    def execute_grasp(self, final, approach_trajectory, streamer=None):
+        clamped, _gpos, _gtor = self.grasp_and_close(
+            final, approach_trajectory, streamer
+        )
         if not clamped:
             return False
         return self.finish_place_sequence()
@@ -482,16 +764,14 @@ class GraspPlanner:
                 tool_rotation = np.asarray(candidate["tool_rotation"], dtype=float)
                 tool_target = np.asarray(candidate["tool_target"], dtype=float)
 
-                provisional = None
-                for seed in (current_joints, cfg.manual_grasp_ik_seed):
-                    provisional = self.solve_ik(
-                        joint6_target,
-                        tool_rotation,
-                        np.asarray(seed, dtype=float),
-                        cfg.graspnet_max_joint_jump,
-                    )
-                    if provisional is not None:
-                        break
+                provisional = self.validate_candidate(
+                    tool_target,
+                    joint6_target,
+                    tool_rotation,
+                    (current_joints, cfg.manual_grasp_ik_seed),
+                    cfg.graspnet_max_joint_jump,
+                    label="GraspNet grasp",
+                )
                 if provisional is None:
                     print(
                         f"[{label}] J1={joint1:+.2f}: "
@@ -505,7 +785,11 @@ class GraspPlanner:
                 print(f"Target          : {detection['class_name']} ({detection['color']})")
                 print(f"Confidence      : {detection['confidence']:.3f}")
                 print(f"Color vote      : {detection['color_confidence']:.1%}")
-                print(f"Depth           : {detection['depth_m']:.3f} m")
+                print(
+                    f"Depth           : {detection['depth_m']:.3f} m, "
+                    f"samples={detection.get('depth_samples', 0)}, "
+                    f"spread={detection.get('depth_spread_m', float('nan')) * 1000.0:.1f} mm"
+                )
                 print(f"Grasp score     : {candidate['score']:.3f}")
                 print(f"Gripper width   : {candidate['gripper_width']:.3f} m")
                 print(f"Tool target     : {np.round(tool_target, 3)} m")
@@ -516,6 +800,7 @@ class GraspPlanner:
                     "joint6_target": joint6_target,
                     "tool_rotation": tool_rotation,
                     "tool_target": tool_target,
+                    "base_point": target_base_point,
                     "provisional_joints": provisional,
                     "scan_joint1": joint1,
                     "scan_joint_position": scan_joint_position,
@@ -526,6 +811,94 @@ class GraspPlanner:
         print(f"[{label}] J1={joint1:+.2f}: no reachable GraspNet candidate.")
         return None
 
+    @staticmethod
+    def _color_matches_request(color, requested_color):
+        if requested_color is None:
+            return color != "unknown"
+        return color == requested_color
+
+    def _accumulate_candidate_color(
+        self,
+        camera_feed,
+        detection,
+        intrinsic,
+        base_camera,
+        requested_color,
+        after_sequence,
+    ):
+        """Merge weak color evidence only while the arm is stationary."""
+        cfg = self.config
+        evidence_items = [detection["color_evidence"]]
+        tracked = apply_accumulated_color(detection, evidence_items, 1, cfg)
+        if (
+            tracked["color"] != "unknown"
+            and tracked["color_confidence"] >= cfg.color_single_frame_strong_ratio
+        ):
+            return tracked, after_sequence
+
+        _, tracked_point = object_base_position(tracked, intrinsic, base_camera)
+        matched_frames = 1
+        marker = after_sequence
+        for _frame_index in range(1, cfg.color_accumulation_max_frames):
+            capture = camera_feed.wait_for_newer(
+                marker,
+                timeout=cfg.camera_detection_timeout,
+            )
+            if capture is None:
+                break
+            marker = capture["frame_seq"]
+
+            nearest = None
+            nearest_point = None
+            nearest_distance = float("inf")
+            for candidate in capture["detections"]:
+                try:
+                    _, candidate_point = object_base_position(
+                        candidate,
+                        intrinsic,
+                        base_camera,
+                    )
+                except Exception:
+                    continue
+                distance = float(np.linalg.norm(candidate_point - tracked_point))
+                if distance < nearest_distance:
+                    nearest = candidate
+                    nearest_point = candidate_point
+                    nearest_distance = distance
+
+            if (
+                nearest is None
+                or nearest_distance > cfg.color_track_position_tolerance_m
+            ):
+                continue
+
+            tracked = dict(nearest)
+            tracked_point = 0.7 * tracked_point + 0.3 * nearest_point
+            evidence_items.append(tracked["color_evidence"])
+            matched_frames += 1
+            accumulated = apply_accumulated_color(
+                tracked,
+                evidence_items,
+                matched_frames,
+                cfg,
+            )
+            if (
+                matched_frames >= cfg.color_accumulation_min_frames
+                and accumulated["color_samples"] >= cfg.color_accumulation_min_samples
+                and self._color_matches_request(
+                    accumulated["color"],
+                    requested_color,
+                )
+            ):
+                return accumulated, marker
+
+        return apply_accumulated_color(
+            tracked,
+            evidence_items,
+            matched_frames,
+            cfg,
+        ), marker
+
     def _detect_at_pose(
         self,
         camera_feed,
@@ -534,22 +907,82 @@ class GraspPlanner:
         selected_color,
         joint1,
         label,
+        reference_base_point=None,
     ):
         cfg = self.config
         color_label = selected_color if selected_color is not None else "any colour"
-        sample_time = time.monotonic()
-        capture = camera_feed.wait_for_newer(
-            sample_time, timeout=self.config.camera_detection_timeout
-        )
-        if capture is None:
-            print(f"[{label}] J1={joint1:+.2f}: invalid camera frame.")
+        stable_joint_position = self.wait_until_stationary()
+        if stable_joint_position is None:
             return None
+        marker_method = getattr(camera_feed, "freshness_marker", None)
+        after_timestamp = (
+            marker_method() if callable(marker_method) else time.monotonic()
+        )
+        capture = None
+        for warmup_index in range(cfg.scan_frame_warmup):
+            capture = camera_feed.wait_for_newer(
+                after_timestamp,
+                timeout=cfg.camera_detection_timeout,
+            )
+            if capture is None:
+                print(
+                    f"[{label}] J1={joint1:+.2f}: camera frame "
+                    f"{warmup_index + 1}/{cfg.scan_frame_warmup} timed out."
+                )
+                return None
+            after_timestamp = capture.get(
+                "frame_seq",
+                capture["detections_timestamp"],
+            )
 
+        capture_intrinsic = capture.get("intrinsics")
+        if capture_intrinsic is not None:
+            intrinsic = capture_intrinsic
+
+        scan_joint_position = self.current_joint_position()
+        joint_drift = float(np.max(np.abs(scan_joint_position - stable_joint_position)))
+        if joint_drift > cfg.detection_stationary_joint_tolerance:
+            print(
+                f"[{label}] arm drifted {joint_drift:.4f} rad during RGB-D inference; "
+                "snapshot rejected."
+            )
+            return None
+        print(
+            f"[{label}] frame={capture['frame_seq']}, "
+            f"infer={float(capture.get('inference_latency_s', 0.0)) * 1000.0:.0f} ms, "
+            f"age={float(capture.get('snapshot_age_s', 0.0)) * 1000.0:.0f} ms, "
+            f"joint_drift={joint_drift:.4f} rad"
+        )
         with self.sdk_call():
-            base_camera = get_base_camera_transform(self.robot, tcp_camera)
-        detections = capture["detections"]
+            base_camera = get_base_camera_transform(
+                self.robot,
+                tcp_camera,
+                scan_joint_position,
+            )
+        capture["robot_joint_position"] = scan_joint_position.copy()
+        capture["base_camera"] = np.asarray(base_camera, dtype=float).copy()
+        detections = []
+        color_marker = capture["frame_seq"]
+        for candidate_index, detection in enumerate(capture["detections"], start=1):
+            accumulated, color_marker = self._accumulate_candidate_color(
+                camera_feed,
+                detection,
+                intrinsic,
+                base_camera,
+                selected_color,
+                color_marker,
+            )
+            print(
+                f"[COLOR] J1={joint1:+.2f} candidate {candidate_index}: "
+                f"{accumulated['color']} "
+                f"confidence={accumulated['color_confidence']:.1%}, "
+                f"frames={accumulated['color_frames']}, "
+                f"samples={accumulated['color_samples']}, "
+                f"margin={accumulated['color_margin']:.1%}."
+            )
+            detections.append(accumulated)
         if selected_color is None:
-            matches = detections
+            matches = [d for d in detections if d.get("color") != "unknown"]
         else:
             matches = [d for d in detections if d.get("color") == selected_color]
         if not matches:
@@ -571,7 +1004,34 @@ class GraspPlanner:
             return None
         matches = central_matches
 
-        scan_joint_position = self.current_joint_position()
+        if reference_base_point is not None:
+            reference_base_point = np.asarray(reference_base_point, dtype=float)
+            tracked = []
+            for detection in matches:
+                try:
+                    _camera_point, candidate_base = object_base_position(
+                        detection, intrinsic, base_camera
+                    )
+                except Exception:
+                    continue
+                tracked.append(
+                    (
+                        float(np.linalg.norm(candidate_base - reference_base_point)),
+                        detection,
+                    )
+                )
+            if not tracked:
+                print(f"[{label}] original target could not be tracked.")
+                return None
+            target_shift, nearest_detection = min(tracked, key=lambda item: item[0])
+            if target_shift > cfg.pre_grasp_abort_shift_m:
+                print(
+                    f"[{label}] nearest same-colour target shifted {target_shift:.3f} m; "
+                    "refusing to switch objects."
+                )
+                return None
+            matches = [nearest_detection]
+
         if cfg.use_graspnet:
             return self._select_graspnet_candidate(
                 camera_feed,
@@ -604,14 +1064,13 @@ class GraspPlanner:
             except Exception as exc:
                 print(f"[{label}] J1={joint1:+.2f}: target geometry rejected: {exc!r}")
                 continue
-            if not workspace_ok(tool_target, joint6_target, cfg):
-                continue
-
-            provisional = self.solve_ik(
+            provisional = self.validate_candidate(
+                tool_target,
                 joint6_target,
                 tool_rotation,
-                cfg.manual_grasp_ik_seed,
+                (cfg.manual_grasp_ik_seed, scan_joint_position),
                 cfg.max_home_to_grasp_step,
+                label="OBB grasp",
             )
             if provisional is None:
                 print(f"[{label}] J1={joint1:+.2f}: target IK is invalid.")
@@ -627,7 +1086,11 @@ class GraspPlanner:
                 f"Pixel      : ({detection['pixel'][0]:.1f}, "
                 f"{detection['pixel'][1]:.1f})"
             )
-            print(f"Depth      : {detection['depth_m']:.3f} m")
+            print(
+                f"Depth      : {detection['depth_m']:.3f} m, "
+                f"samples={detection.get('depth_samples', 0)}, "
+                f"spread={detection.get('depth_spread_m', float('nan')) * 1000.0:.1f} mm"
+            )
             print(f"Camera xyz : {np.round(camera_point, 3)} m")
             print(f"Base xyz   : {np.round(base_point, 3)} m")
             print(f"Seeed-ray approach tilt      : {approach_tilt_deg:.1f} deg")
@@ -643,6 +1106,9 @@ class GraspPlanner:
             return {
                 "joint6_target": joint6_target,
                 "tool_rotation": tool_rotation,
+                "tool_target": tool_target,
+                "base_point": base_point,
+                "provisional_joints": provisional,
                 "scan_joint1": joint1,
                 "scan_joint_position": scan_joint_position,
             }
@@ -693,7 +1159,10 @@ class GraspPlanner:
             if result is not None:
                 return result
 
-        print("[SCAN] completed +2.30 -> -2.30 rad; requested target was not found.")
+        print(
+            f"[SCAN] completed {cfg.scan_j1_start:+.2f} -> "
+            f"{cfg.scan_j1_end:+.2f} rad; requested target was not found."
+        )
         return None
 
     def detect_once_at_position(
@@ -723,6 +1192,78 @@ class GraspPlanner:
             "RETRY",
         )
 
+    def pre_grasp_and_redetect(
+        self,
+        camera_feed,
+        intrinsic,
+        tcp_camera,
+        selected_color,
+        found,
+    ):
+        """Move to pre-grasp, re-detect the same object, then realign once."""
+        cfg = self.config
+        original_base_point = np.asarray(found["base_point"], dtype=float)
+        pre_grasp_joints = self.plan_pre_grasp(found)
+        if pre_grasp_joints is not None:
+            print("[PREGRASP] moving to the 5 cm waypoint ...")
+            self.move_j(
+                pre_grasp_joints,
+                cfg.pre_grasp_duration,
+                "PRE GRASP",
+            )
+        if not self.sleep_interruptible(cfg.pre_grasp_camera_settle_time):
+            return None
+
+        current = self.current_joint_position()
+        print("[PREGRASP] acquiring a fresh RGB-D detection before final grasp ...")
+        refreshed = self._detect_at_pose(
+            camera_feed,
+            intrinsic,
+            tcp_camera,
+            selected_color,
+            float(current[0]),
+            "PREGRASP",
+            reference_base_point=original_base_point,
+        )
+        if refreshed is None:
+            raise RuntimeError(
+                "target was not confirmed from the pre-grasp pose; grasp aborted"
+            )
+        target_shift = float(
+            np.linalg.norm(np.asarray(refreshed["base_point"]) - original_base_point)
+        )
+        print(f"[PREGRASP] refreshed target shift={target_shift:.3f} m")
+
+        correction = self.plan_pre_grasp(refreshed)
+        if correction is not None:
+            if target_shift > cfg.pre_grasp_abort_shift_m:
+                raise RuntimeError(
+                    f"refreshed target shifted {target_shift:.3f} m; grasp aborted"
+                )
+            print("[PREGRASP] realigning to the refreshed 5 cm waypoint ...")
+            self.move_j(
+                correction,
+                cfg.pre_grasp_duration,
+                "REFRESHED PRE GRASP",
+            )
+            if not self.sleep_interruptible(cfg.pre_grasp_camera_settle_time):
+                return None
+        return refreshed
+
+    def _return_to_recognition_pose(self, scan_joints, streamer, reason):
+        """Recover from an empty grasp without terminating the operator loop."""
+        scan_joints = np.asarray(scan_joints, dtype=float)
+        print(f"[RECOVERY] {reason}; returning to the last recognition pose.")
+        self.move_j(
+            scan_joints,
+            self.config.return_home_duration,
+            "RECOGNITION POSE",
+        )
+        if streamer is not None:
+            streamer.set_control_message(
+                f"{reason}。机械臂已回到识别位置，请选择下一个目标。"
+            )
+
     def run_grasp_loop(
         self,
         camera_feed,
@@ -746,8 +1287,16 @@ class GraspPlanner:
                 tcp_camera,
                 selected_color,
             )
-            if found is None or self.interrupted.is_set():
+            if self.interrupted.is_set():
                 return False
+            if found is None:
+                print("[SCAN] no matching block found; returning HOME and asking again.")
+                self.move_j(cfg.home, cfg.return_home_duration, "HOME")
+                if streamer is not None:
+                    streamer.set_control_message(
+                        "没有识别到所选积木，已回到 HOME，请重新选择目标。"
+                    )
+                continue
 
             retry_scan_position = found["scan_joint_position"]
             task_complete = False
@@ -764,37 +1313,52 @@ class GraspPlanner:
                         selected_color,
                         retry_scan_position,
                     )
-                    if found is None or self.interrupted.is_set():
+                    if self.interrupted.is_set():
                         return False
+                    if found is None:
+                        self.open_gripper()
+                        self._return_to_recognition_pose(
+                            retry_scan_position,
+                            streamer,
+                            "重新识别失败",
+                        )
+                        break
 
-                print("[SCAN] valid target found; checking direct scan-pose IK ...")
-                if cfg.use_graspnet and "provisional_joints" in found:
-                    final = np.asarray(found["provisional_joints"], dtype=float)
-                    print("[PLAN] reusing the GraspNet-candidate IK solution.")
-                else:
-                    final = self.plan_grasp(
-                        found["joint6_target"], found["tool_rotation"]
+                found = self.pre_grasp_and_redetect(
+                    camera_feed,
+                    intrinsic,
+                    tcp_camera,
+                    selected_color,
+                    found,
+                )
+                if self.interrupted.is_set():
+                    return False
+                if found is None:
+                    self.open_gripper()
+                    self._return_to_recognition_pose(
+                        retry_scan_position,
+                        streamer,
+                        "预抓取复检失败",
                     )
-                print("[PLAN] direct scan-pose grasp IK verified; auto grasp starts now.")
+                    break
 
-                pre_grasp_joints = None
-                if cfg.use_graspnet and "tool_target" in found:
-                    pre_grasp_joints = self.plan_graspnet_pre_grasp(found)
-                    if pre_grasp_joints is None:
-                        print("[GRASP] pre-grasp IK failed; using direct grasp only.")
+                print("[PREGRASP] refreshed target found; validating straight approach ...")
+                approach_trajectory = self.plan_cartesian_approach(found)
+                final = np.asarray(approach_trajectory[-1], dtype=float)
+                print("[PLAN] full Cartesian approach verified; auto grasp starts now.")
 
                 clamped, gpos, gtor = self.grasp_and_close(
                     final,
+                    approach_trajectory,
                     streamer=streamer,
-                    pre_grasp_joints=pre_grasp_joints,
                 )
                 if not clamped:
-                    print("[GRASP] clamp failed; releasing and returning HOME.")
+                    print("[GRASP] clamp failed; releasing for another target.")
                     self.open_gripper()
-                    self.move_j(
-                        cfg.home,
-                        cfg.return_home_duration,
-                        "HOME",
+                    self._return_to_recognition_pose(
+                        retry_scan_position,
+                        streamer,
+                        "夹爪未抓到物体",
                     )
                     break
 
@@ -818,20 +1382,21 @@ class GraspPlanner:
                 if attempt >= cfg.grasp_max_attempts:
                     print(
                         "[RETRY] second attempt still below threshold; "
-                        "returning HOME and asking again."
+                        "returning to recognition pose and asking again."
                     )
-                    self.move_j(
-                        cfg.home,
-                        cfg.return_home_duration,
-                        "HOME",
+                    self._return_to_recognition_pose(
+                        retry_scan_position,
+                        streamer,
+                        "夹爪力不足，未确认抓到物体",
                     )
 
             if task_complete:
                 return True
         return False
 
-    def zero_confirmed(self):
+    def pose_confirmed(self, target, label):
         cfg = self.config
+        target = np.asarray(target, dtype=float)
         deadline = time.monotonic() + cfg.zero_verify_timeout
         stable = 0
         while time.monotonic() < deadline:
@@ -846,62 +1411,144 @@ class GraspPlanner:
             ):
                 raise RuntimeError("invalid joint state during ZERO verification")
             if (
-                np.max(np.abs(q - cfg.zero)) <= cfg.zero_position_tolerance
+                np.max(np.abs(q - target)) <= cfg.zero_position_tolerance
                 and np.max(np.abs(dq)) <= cfg.zero_velocity_tolerance
             ):
                 stable += 1
                 if stable >= cfg.zero_stable_samples:
-                    print(f"[SHUTDOWN] ZERO confirmed: q={np.round(q, 4)}, dq={np.round(dq, 4)}")
+                    print(
+                        f"[SHUTDOWN] {label} confirmed: "
+                        f"q={np.round(q, 4)}, dq={np.round(dq, 4)}"
+                    )
                     return True
             else:
                 stable = 0
             time.sleep(0.10)
         return False
 
-    def hold_position_forever(self, last_command):
-        print("[SAFETY FAULT] ZERO not confirmed; set_stop is forbidden. Holding with power.")
+    def zero_confirmed(self):
+        return self.pose_confirmed(self.config.zero, "ZERO")
+
+    def _fault_hold_and_stop(self, reason: Exception) -> bool:
+        """Hold only a freshly measured pose, then stop; never replay stale HOME."""
+        cfg = self.config
+        self.lifecycle_state = RobotLifecycleState.FAULT_HOLD
+        print(f"[SAFETY FAULT] controlled shutdown fallback: {reason!r}")
         try:
             hold = self.current_joint_position()
-        except Exception:
-            hold = np.asarray(last_command, dtype=float)
-        while True:
-            try:
-                with self.sdk_call():
-                    self.robot.Joint_Pos_Vel(
-                        hold.tolist(),
-                        [0.10] * 6,
-                        self.config.max_torque,
-                        iswait=False,
-                    )
-            except Exception as exc:
-                print(f"[SAFETY FAULT] hold command failed: {exc!r}")
-            time.sleep(0.10)
+            if hold.shape != (6,) or not np.all(np.isfinite(hold)):
+                raise RuntimeError("current joint feedback is invalid")
+            with self.sdk_call():
+                self.robot.Joint_Pos_Vel(
+                    hold.tolist(),
+                    [0.0] * 6,
+                    cfg.max_torque,
+                    iswait=False,
+                )
+            self._remember_command(hold)
+            time.sleep(max(0.0, cfg.shutdown_fault_hold_time))
+        except Exception as exc:
+            print(
+                "[SAFETY FAULT] no position hold was sent because fresh joint "
+                f"feedback is unavailable: {exc!r}"
+            )
 
-    def safe_shutdown(self, pipeline, last_command):
+        try:
+            with self.sdk_call():
+                self.robot.set_stop()
+            self.lifecycle_state = RobotLifecycleState.STOPPED
+            print("[SAFETY FAULT] motor stop command sent.")
+        except Exception as stop_exc:
+            print(f"[SAFETY FAULT] motor stop command failed: {stop_exc!r}")
+        return False
+
+    def safe_shutdown(
+        self,
+        pipeline=None,
+        last_command=None,
+        *,
+        return_home=False,
+        shutdown_target=None,
+        shutdown_label=None,
+    ):
+        """Converge every exit path to a finite ZERO-or-fault-stop sequence.
+
+        ``last_command`` remains in the signature for callers built against the
+        previous API, but is deliberately ignored: replaying a stale HOME after
+        joint-feedback failure is unsafe. ``shutdown_target`` lets the owning
+        single-process entry return to a freshly captured pre-program pose;
+        callers that do not provide it retain the ZERO/HOME compatibility path.
+        """
+        del last_command
+        with self._shutdown_lock:
+            if self._shutdown_complete:
+                return self._shutdown_succeeded
+
+            return self._safe_shutdown_once(
+                pipeline,
+                return_home=return_home,
+                shutdown_target=shutdown_target,
+                shutdown_label=shutdown_label,
+            )
+
+    def _safe_shutdown_once(
+        self,
+        pipeline,
+        *,
+        return_home=False,
+        shutdown_target=None,
+        shutdown_label=None,
+    ) -> bool:
         cfg = self.config
-        print("\n[SHUTDOWN] stopping camera and returning to ZERO ...")
-        self._say("任务结束，机械臂回零")
+        if shutdown_target is not None:
+            target = np.asarray(shutdown_target, dtype=float)
+            label = str(shutdown_label or "STARTUP POSE")
+            duration = cfg.return_home_duration
+        else:
+            target = cfg.home if return_home else cfg.zero
+            label = "HOME" if return_home else "ZERO"
+            duration = cfg.return_home_duration if return_home else cfg.zero_duration
+        timeout = max(cfg.zero_move_timeout, duration + 5.0)
+        print(f"\n[SHUTDOWN] stopping camera and returning to {label} ...")
+        self._say(f"任务结束，机械臂返回{label}")
+        self.lifecycle_state = RobotLifecycleState.STOPPING
         if pipeline is not None:
             try:
                 pipeline.stop()
             except Exception as exc:
                 print(f"[SHUTDOWN] camera stop warning: {exc!r}")
         try:
+            if (
+                target.shape != (6,)
+                or not np.all(np.isfinite(target))
+                or np.any(target < cfg.joint_lower)
+                or np.any(target > cfg.joint_upper)
+            ):
+                raise RuntimeError(f"invalid {label} shutdown target: {target!r}")
             with self.sdk_call():
                 result = self.robot.moveJ(
-                    cfg.zero.tolist(),
-                    duration=cfg.zero_duration,
+                    target.tolist(),
+                    duration=duration,
                     max_tqu=cfg.max_torque,
                     iswait=True,
+                    timeout=timeout,
                 )
             if result is False:
-                raise RuntimeError("ZERO move rejected or timed out")
+                raise RuntimeError(f"{label} move rejected or timed out")
+            self._remember_command(target)
             time.sleep(cfg.zero_settle_time)
-            if not self.zero_confirmed():
-                raise RuntimeError("ZERO was not confirmed")
+            if not self.pose_confirmed(target, label):
+                raise RuntimeError(f"{label} was not confirmed")
             with self.sdk_call():
                 self.robot.set_stop()
+            self.lifecycle_state = RobotLifecycleState.STOPPED
+            self._shutdown_complete = True
+            self._shutdown_succeeded = True
             print("[SHUTDOWN] motors stopped.")
+            return True
         except Exception as exc:
             print(f"[SHUTDOWN] failure: {exc!r}")
-            self.hold_position_forever(last_command)
+            result = self._fault_hold_and_stop(exc)
+            self._shutdown_complete = True
+            self._shutdown_succeeded = False
+            return result

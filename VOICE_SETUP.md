@@ -1,91 +1,73 @@
-# 语音功能迁移与运行说明
+# 语音功能说明
 
-本项目已把 `iq9075_speech`（听）和 `iq9075_tts`（说）复制到仓库内，并接入
-`grasp_demo.py` / `grasp_planner.py`。
-
-## 目录
+项目把离线语音组件放在仓库内，并通过 `voice_controller.py` 接入单体入口和 ROS2 voice node。
 
 ```text
-pathera_grasp/
-├── iq9075_speech/        # 语音识别组件（sherpa-onnx SenseVoice）
-├── iq9075_tts/           # 语音播报组件（sherpa-onnx VITS / edge-tts / QNN MeloTTS）
-├── voice_controller.py   # grasp_demo 使用的语音胶水层
-├── voice_demo/           # ASR/TTS 自测脚本与模型下载脚本
-├── requirements_asr.txt
-├── requirements_tts.txt
-└── models/
-    ├── sensevoice/       # ASR 模型：model.onnx + tokens.txt + meta.json
-    └── sherpa_tts/       # 离线 TTS 模型：vits-melo-tts-zh_en
+iq9075_speech/     SenseVoice ASR 组件
+iq9075_tts/        sherpa-onnx VITS、edge/QNN 等 TTS 后端实现
+voice_controller.py 主流程使用的半双工胶水层
+voice_demo/        独立 ASR/TTS 演示和模型下载脚本
+models/sensevoice/ ASR 模型
+models/sherpa_tts/ VITS/MeloTTS 模型
 ```
 
-## 安装依赖
+## 当前集成后端
 
-```bash
-source /home/ubuntu/miniconda3/etc/profile.d/conda.sh
-conda activate pathera_grasp
-pip install -r requirements_asr.txt -r requirements_tts.txt
+主抓取流程固定使用项目内、离线、CPU 路径：
+
+- ASR：`sherpa-onnx + SenseVoice`
+- TTS：`sherpa-onnx + VITS/MeloTTS`
+
+即使语音包内部存在 edge-tts 或 QNN 选择，`grasp_demo.py` 和 ROS2 `panthera_voice` 当前不会自动切换到它们。可选 QNN ASR 的历史路径不属于主流程，也不应作为迁移依赖。
+
+## 半双工行为
+
+`VoiceInterface` 现在保证以下顺序：
+
+```text
+TTS 播报入队 → 等待队列和播放器结束 → 短暂声学消退 → ASR 录音
 ```
 
-目标环境还需要系统工具：
+录音期间 `say()` 会与录音共用锁，新的状态播报会等待，不会播放到正在录音的麦克风中。ROS2 voice node 还在 listen request 后使用短暂 debounce，确保前一个 `voice/say` topic 回调有机会先入队。
 
-- `mplayer`：语音播放。
-- `arecord`：麦克风录音（`record_and_transcribe` 使用，可选）。
+这减少提示词自回声，但不替代真实声学环境中的 AEC、唤醒词或人工确认；真机仍应在环境噪声下验证。
 
-## 模型
+## 颜色命令
 
-模型文件已放在 `pathera_grasp/models/`，换机器时整个项目目录一起拷贝即可，不需要
-再依赖 `/home/ubuntu/work` 下的路径。
+支持红、黄、蓝、绿、白、黑和任意颜色，中英文均可。解析器会识别直接否定：
 
-如果模型文件丢失，可在项目根目录执行：
-
-```bash
-bash voice_demo/download_sensevoice.sh
-bash voice_demo/download_melo_tts.sh
+```text
+“不要红色”          → 不接受，不自动抓取
+“不要红色，要蓝色”  → 选择蓝色
+“不是黄色，抓绿色”  → 选择绿色
 ```
 
-模型路径也可以手动用环境变量覆盖：
+多颜色、复杂否定或自然语言歧义没有大模型语义消解；不确定时会回退终端输入，而不是猜测抓取目标。
+
+## 运行参数
 
 ```bash
-export IQ9075_ASR_MODEL_DIR=/path/to/sensevoice
-export IQ9075_SHERPA_TTS_MODEL_DIR=/path/to/vits-melo-tts-zh_en
-```
-
-## 语音后端默认值
-
-为保证换机器也能离线运行，项目默认采用：
-
-- ASR：`sherpa-onnx + SenseVoice`，CPU 推理。
-- TTS：`sherpa-onnx + VITS`，CPU 离线合成。
-
-可以通过环境变量切换：
-
-```bash
-# 语音输入关闭（回退到终端输入）
+# 关闭语音，始终使用终端选择颜色
 VOICE_INPUT=0 python grasp_demo.py
 
-# 单次语音识别录音时长，单位秒
+# 单次录音时长（秒）
 VOICE_PROMPT_DURATION=5 python grasp_demo.py
+
+# 覆盖项目内模型目录
+IQ9075_ASR_MODEL_DIR=/path/to/sensevoice python grasp_demo.py
+IQ9075_SHERPA_TTS_MODEL_DIR=/path/to/vits-melo-tts-zh_en python grasp_demo.py
 ```
 
-## 自测
+主流程需要系统提供 `arecord`（录音）和播放器（默认 `mplayer`）。本次没有执行这些命令，也没有安装依赖。
+
+## 独立离线检查
+
+这些脚本会触发本机声卡或播放设备，不属于 TASK-003 的无硬件验证范围：
 
 ```bash
-cd pathera_grasp
-
-# TTS：离线合成并播放一句
-python voice_demo/demo_say.py "小八在，检测到红色方块"
-
-# ASR：识别一个 16kHz WAV
+python voice_demo/demo_say.py "检测到红色方块"
 python voice_demo/demo_transcribe_file.py /path/to/audio.wav
-
-# ASR：arecord 录音 3 秒后识别
 python voice_demo/demo_transcribe_mic.py
 ```
 
-## 接入点
-
-- 语音选择颜色：`grasp_demo.py` 的 `choose_target_at_start(voice)` 会先尝试一次
-  语音识别，识别到“红色积木/黄色积木/蓝色积木/任意颜色”后直接执行；识别失败时
-  回退到终端输入。
-- 语音状态播报：`grasp_planner.py` 会在回 HOME、开始扫描、发现目标、夹紧、放置、
-  回零等关键节点通过 `VoiceInterface.say()` 非阻塞播报。
+仅验证代码逻辑时使用项目根目录的 `python tools/run_offline_tests.py`；它用 fake recognizer/speaker 测试半双工顺序，不访问声卡。

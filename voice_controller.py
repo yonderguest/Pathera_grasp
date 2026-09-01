@@ -13,6 +13,8 @@ class reports ``available=False`` and the demo falls back to terminal input.
 
 from __future__ import annotations
 
+import threading
+import time
 from pathlib import Path
 
 
@@ -33,6 +35,8 @@ class VoiceInterface:
         self.available = False
         self._recognizer = None
         self._speaker = None
+        self._audio_lock = threading.Lock()
+        self._playback_settle_seconds = 0.25
 
         if not self.enabled:
             return
@@ -68,18 +72,40 @@ class VoiceInterface:
         if not self.available or self._speaker is None or not text:
             return
         try:
-            self._speaker.say(text)
+            # A recognition session owns this lock until recording ends, so a
+            # status announcement can never play into the microphone.
+            with self._audio_lock:
+                self._speaker.say(text)
         except Exception as exc:  # noqa: BLE001
             print(f"[VOICE] announcement failed: {exc!r}")
+
+    def wait_until_idle(self, timeout: float = 30.0) -> bool:
+        """Wait for queued TTS and the audio player to drain."""
+        if self._speaker is None:
+            return True
+        deadline = time.monotonic() + max(0.0, timeout)
+        while self._speaker.is_busy():
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(0.05)
+        return True
 
     def listen_for_command(self) -> str | None:
         """Record one voice command and return its text, or None on failure."""
         if not self.available or self._recognizer is None:
             return None
         try:
-            text = self._recognizer.record_and_transcribe(
-                duration=self.prompt_duration
-            )
+            with self._audio_lock:
+                if not self.wait_until_idle():
+                    print("[VOICE] TTS drain timed out; stopping playback before ASR.")
+                    if self._speaker is not None:
+                        self._speaker.stop()
+                # Player exit normally drains ALSA; this short guard interval
+                # lets residual acoustic echo decay before opening arecord.
+                time.sleep(self._playback_settle_seconds)
+                text = self._recognizer.record_and_transcribe(
+                    duration=self.prompt_duration
+                )
             return (text or "").strip() or None
         except Exception as exc:  # noqa: BLE001
             print(f"[VOICE] listen failed: {exc!r}")
@@ -89,7 +115,9 @@ class VoiceInterface:
         """Release ASR model and stop the TTS worker."""
         if self._speaker is not None:
             try:
-                self._speaker.close()
+                with self._audio_lock:
+                    self.wait_until_idle(timeout=2.0)
+                    self._speaker.close()
             except Exception:
                 pass
             self._speaker = None

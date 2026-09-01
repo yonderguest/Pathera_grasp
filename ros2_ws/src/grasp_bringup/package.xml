@@ -1,0 +1,21 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>grasp_bringup</name>
+  <version>0.1.0</version>
+  <description>Launch file for the separated Panthera grasp ROS2 system.</description>
+  <maintainer email="aiuser@example.com">aiuser</maintainer>
+  <license>Apache-2.0</license>
+
+  <depend>launch</depend>
+  <depend>launch_ros</depend>
+
+  <exec_depend>panthera_voice</exec_depend>
+  <exec_depend>panthera_vision</exec_depend>
+  <exec_depend>panthera_stream</exec_depend>
+  <exec_depend>panthera_grasp_brain</exec_depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>
