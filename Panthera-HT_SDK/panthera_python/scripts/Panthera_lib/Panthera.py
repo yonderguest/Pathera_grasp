@@ -5,7 +5,7 @@ import yaml
 import numpy as np
 import pinocchio as pin
 from scipy.spatial.transform import Rotation as R
-from scipy.interpolate import CubicSpline
+from scipy.interpolate import CubicSpline, PchipInterpolator
 
 _SDK_ROOT = os.path.normpath(os.path.join(os.path.dirname(__file__), "..", ".."))
 if _SDK_ROOT not in sys.path:
@@ -1375,6 +1375,14 @@ class Panthera(htr.Robot):  # 继承自htr.Robot
         kd = [3.0, 5.0, 6.0, 2.5, 1.5, 1.0]
 
         start_time = time.perf_counter()
+        max_dispatch_lateness = 0.0
+        max_command_time = 0.0
+        late_dispatches = 0
+        nominal_period = (
+            float(np.median(np.diff(np.asarray(timestamps, dtype=float))))
+            if len(timestamps) > 1
+            else 0.0
+        )
 
         for i in range(len(joint_trajectory)):
             loop_start = time.perf_counter()
@@ -1385,6 +1393,13 @@ class Panthera(htr.Robot):  # 继承自htr.Robot
             # 等待到正确的时间点
             while (time.perf_counter() - start_time) < target_time:
                 time.sleep(0.0001)
+
+            dispatch_lateness = max(
+                0.0, time.perf_counter() - start_time - target_time
+            )
+            max_dispatch_lateness = max(max_dispatch_lateness, dispatch_lateness)
+            if dispatch_lateness > max(0.005, 0.5 * nominal_period):
+                late_dispatches += 1
 
             # # 使用 Joint_Pos_Vel 模式发送控制指令
             # success = self.Joint_Pos_Vel(
@@ -1409,14 +1424,19 @@ class Panthera(htr.Robot):  # 继承自htr.Robot
                 print(f"  ✗ 控制失败于点 {i+1}/{len(joint_trajectory)}")
                 return False
 
-            # 监控时序
-            actual_time = time.perf_counter() - start_time
-            time_error = actual_time - target_time
-            if time_error > 0.005:  # 超过 5ms
-                print(f"  ⚠ 时序延迟: {time_error*1000:.1f}ms")
+            max_command_time = max(
+                max_command_time, time.perf_counter() - loop_start
+            )
 
         total_time = time.perf_counter() - start_time
         print(f"  ✓ 实际执行时间: {total_time:.3f}s")
+        if late_dispatches:
+            print(
+                "  ⚠ 控制时序汇总: "
+                f"late={late_dispatches}/{len(joint_trajectory)}, "
+                f"max_dispatch={max_dispatch_lateness * 1000.0:.1f}ms, "
+                f"max_command={max_command_time * 1000.0:.1f}ms"
+            )
 
         return True
     
@@ -1721,8 +1741,17 @@ class Panthera(htr.Robot):  # 继承自htr.Robot
         duration,
         max_torque,
         label="Cartesian approach",
+        control_period=0.02,
     ):
-        """Execute a prevalidated joint path without spline deviation."""
+        """Execute a prevalidated path with dense shape-preserving commands.
+
+        ``compute_cartesian_path`` returns points at Cartesian ``eef_step``
+        spacing, not at a motor-control rate.  Sending those sparse points
+        directly leaves hundreds of milliseconds between MIT commands and can
+        look like a sudden drop.  PCHIP stays inside each joint segment's data
+        range, while smooth time scaling gives zero endpoint velocity without
+        the overshoot risk of a free cubic spline.
+        """
         trajectory = np.asarray(joint_trajectory, dtype=float)
         if (
             trajectory.ndim != 2
@@ -1740,25 +1769,58 @@ class Panthera(htr.Robot):  # 继承自htr.Robot
         if np.any(trajectory < lower) or np.any(trajectory > upper):
             raise RuntimeError(f"{label} trajectory exceeds joint limits")
 
-        dt = duration / (trajectory.shape[0] - 1)
-        segment_velocities = np.diff(trajectory, axis=0) / dt
+        control_period = float(control_period)
+        if not 0.010 <= control_period <= 0.050:
+            raise RuntimeError(f"{label} control period is outside 10..50 ms")
+
+        sparse_count = trajectory.shape[0]
+        knot_progress = np.linspace(0.0, 1.0, sparse_count)
+        control_count = max(sparse_count, int(np.ceil(duration / control_period)) + 1)
+        timestamps_array = np.linspace(0.0, duration, control_count)
+        normalized_time = timestamps_array / duration
+        path_progress = normalized_time * normalized_time * (3.0 - 2.0 * normalized_time)
+        progress_rate = (
+            6.0 * normalized_time * (1.0 - normalized_time) / duration
+        )
+        interpolator = PchipInterpolator(knot_progress, trajectory, axis=0)
+        control_trajectory = np.asarray(interpolator(path_progress), dtype=float)
+        control_velocities = np.asarray(
+            interpolator.derivative()(path_progress), dtype=float
+        ) * progress_rate[:, None]
+        # Preserve the exact validated boundary states despite floating-point
+        # interpolation and enter/leave the path with a stationary command.
+        control_trajectory[0] = trajectory[0]
+        control_trajectory[-1] = trajectory[-1]
+        control_velocities[0] = 0.0
+        control_velocities[-1] = 0.0
+
+        if (
+            not np.all(np.isfinite(control_trajectory))
+            or not np.all(np.isfinite(control_velocities))
+            or np.any(control_trajectory < lower)
+            or np.any(control_trajectory > upper)
+        ):
+            raise RuntimeError(f"{label} resampled trajectory is invalid")
+
+        actual_dt = duration / (control_count - 1)
         velocity_limits = np.asarray(self.velocity_limits, dtype=float)
-        if np.any(np.abs(segment_velocities) > velocity_limits + 1e-6):
+        if np.any(np.abs(control_velocities) > velocity_limits + 1e-6):
             raise RuntimeError(f"{label} trajectory exceeds velocity limits")
-        if segment_velocities.shape[0] > 1:
-            acceleration = np.diff(segment_velocities, axis=0) / dt
+        if control_velocities.shape[0] > 1:
+            acceleration = np.diff(control_velocities, axis=0) / actual_dt
             acceleration_limits = np.asarray(self.acceleration_limits, dtype=float)
             if np.any(np.abs(acceleration) > acceleration_limits + 1e-6):
                 raise RuntimeError(f"{label} trajectory exceeds acceleration limits")
 
-        timestamps = np.linspace(0.0, duration, trajectory.shape[0]).tolist()
-        velocities = np.vstack(
-            (segment_velocities, np.zeros((1, self.motor_count), dtype=float))
+        print(
+            f"[{label}] control resample: {sparse_count} planned -> "
+            f"{control_count} commands ({1.0 / actual_dt:.1f} Hz)",
+            flush=True,
         )
         if not self._execute_trajectory(
-            trajectory.tolist(),
-            timestamps,
-            velocities.tolist(),
+            control_trajectory.tolist(),
+            timestamps_array.tolist(),
+            control_velocities.tolist(),
             max_torque,
         ):
             raise RuntimeError(f"{label} execution failed")

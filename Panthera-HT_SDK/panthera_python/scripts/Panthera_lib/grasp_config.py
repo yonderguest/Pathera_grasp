@@ -103,6 +103,15 @@ class GraspConfig:
     pre_grasp_realign_max_orientation_deg: float = 12.0
     pre_grasp_realign_endpoint_tolerance_m: float = 0.010
     pre_grasp_realign_duration: float = 2.5
+    # Cartesian paths are planned sparsely at eef_step resolution, but the
+    # MIT position/velocity controller must be refreshed continuously.  The
+    # executor performs shape-preserving interpolation at this period and
+    # starts only while feedback still matches the validated first sample.
+    trajectory_control_period_s: float = 0.020
+    trajectory_start_joint_tolerance_rad: float = 0.025
+    trajectory_start_tcp_tolerance_m: float = 0.010
+    stationary_hold_period_s: float = 0.050
+    stationary_hold_max_drift_rad: float = 0.025
     # Maximum deviation from the commanded start-to-target Cartesian segment.
     # The separate pre-grasp gate still limits lateral error relative to the
     # tool approach axis; do not use this value to reject a path merely because
@@ -131,16 +140,19 @@ class GraspConfig:
     # One final, position-only visual correction at the collision-separated
     # pre-grasp waypoint.  The close image may be magnified or partly occluded,
     # so never recompute wrist orientation there and accept only a small,
-    # coherent, fully visible RGB-D correction.
+    # coherent, fully visible RGB-D correction.  The latest physical check
+    # found no repeatable Base-Y bias, so close-range vision may correct Base-X
+    # and Base-Z but preserves the far-field Base-Y coordinate.
     close_refine_enabled: bool = True
+    close_refine_preserve_base_y: bool = True
     close_refine_min_depth_m: float = 0.075
     close_refine_border_margin_px: int = 6
     close_refine_max_bbox_area_ratio: float = 0.30
     close_refine_max_depth_spread_m: float = 0.015
-    close_refine_max_position_spread_m: float = 0.006
-    close_refine_max_xy_correction_m: float = 0.010
-    close_refine_max_z_correction_m: float = 0.008
-    close_refine_max_total_correction_m: float = 0.012
+    close_refine_max_position_spread_m: float = 0.009
+    close_refine_max_xy_correction_m: float = 0.035
+    close_refine_max_z_correction_m: float = 0.018
+    close_refine_max_total_correction_m: float = 0.035
     graspnet_z_offset_m: float = -0.20
     graspnet_max_joint_jump: float = 2.6
     graspnet_scene_expand_px: int = 80
@@ -205,12 +217,11 @@ class GraspConfig:
         )
     )
     # Residual physical correction after the calibrated Camera->TCP chain is
-    # composed explicitly.  The previous [0.150, 0.040, -0.070] m value also
-    # contained the HOME-pose projection of the missing 165 mm joint6->TCP
-    # transform ([0.1402, 0.0000, -0.0869] m); retaining both would double the
-    # tool offset and send the target outside the workspace.
+    # composed explicitly.  Keep all fixed Base-axis compensation at zero;
+    # any accepted close-range correction is measured dynamically from fresh
+    # RGB-D frames and is never persisted as a calibration constant.
     grasp_offset_base: np.ndarray = field(
-        default_factory=lambda: np.array([0.010, 0.040, 0.017], dtype=float)
+        default_factory=lambda: np.array([0.000, 0.000, 0.000], dtype=float)
     )
     # Optional tool-axis overtravel.  A 5 mm trial moved visibly in the intended
     # direction but enlarged the total miss because the tilted tool axis also
@@ -398,6 +409,11 @@ class GraspConfig:
             < self.pre_grasp_orientation_tolerance_deg
             or self.pre_grasp_realign_endpoint_tolerance_m <= 0.0
             or self.pre_grasp_realign_duration <= 0.0
+            or not 0.010 <= self.trajectory_control_period_s <= 0.050
+            or self.trajectory_start_joint_tolerance_rad <= 0.0
+            or self.trajectory_start_tcp_tolerance_m <= 0.0
+            or not 0.020 <= self.stationary_hold_period_s <= 0.100
+            or self.stationary_hold_max_drift_rad <= 0.0
             or self.approach_path_lateral_tolerance_m <= 0.0
             or self.approach_endpoint_tolerance_m <= 0.0
             or self.pre_grasp_duration <= 0.0

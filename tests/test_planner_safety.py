@@ -773,9 +773,9 @@ class PlannerSafetyTests(unittest.TestCase):
         frames = iter(
             [
                 capture(1, [0.300, 0.000, 0.100]),
-                capture(2, [0.304, 0.002, 0.103]),
-                capture(3, [0.305, 0.001, 0.102]),
-                capture(4, [0.303, 0.002, 0.103]),
+                capture(2, [0.328, 0.012, 0.109]),
+                capture(3, [0.331, 0.011, 0.110]),
+                capture(4, [0.329, 0.013, 0.111]),
             ]
         )
 
@@ -830,7 +830,7 @@ class PlannerSafetyTests(unittest.TestCase):
         self.assertIsNotNone(result)
         self.assertTrue(np.allclose(result["tool_rotation"], far_rotation))
         self.assertTrue(
-            np.allclose(result["base_point"], [0.304, 0.002, 0.103])
+            np.allclose(result["base_point"], [0.329, 0.000, 0.110])
         )
 
     def test_weak_color_evidence_is_confirmed_across_matched_frames(self):
@@ -939,6 +939,69 @@ class PlannerSafetyTests(unittest.TestCase):
 
         self.assertTrue(planner.open_gripper())
         self.assertEqual(robot.command[0], 1.8)
+
+    def test_stationary_camera_hold_refreshes_arm_commands(self):
+        class Robot:
+            def __init__(self):
+                self.commands = 0
+
+            @staticmethod
+            def current_joint_position():
+                return np.zeros(6)
+
+            def Joint_Pos_Vel(self, *_args, **_kwargs):
+                self.commands += 1
+                return True
+
+        robot = Robot()
+        config = GraspConfig()
+        config.stationary_hold_period_s = 0.02
+        planner = GraspPlanner(robot, config, threading.Event())
+
+        with planner.hold_current_pose("test camera wait"):
+            threading.Event().wait(0.07)
+
+        self.assertGreaterEqual(robot.commands, 3)
+
+    def test_stale_cartesian_start_is_rejected_before_motor_execution(self):
+        class Robot:
+            @staticmethod
+            def current_joint_position():
+                return np.array([0.10, 0.0, 0.0, 0.0, 0.0, 0.0])
+
+            @staticmethod
+            def forward_kinematics(joints):
+                return {
+                    "position": np.array([float(joints[0]), 0.0, 0.0]),
+                    "rotation": np.eye(3),
+                }
+
+        planner = GraspPlanner(Robot(), GraspConfig(), threading.Event())
+        with self.assertRaisesRegex(RuntimeError, "plan is stale"):
+            planner.validate_trajectory_start(
+                [np.zeros(6), np.full(6, 0.01)],
+                "TEST TRAJECTORY",
+            )
+
+    def test_stop_during_put1_still_releases_before_skipping_put2(self):
+        interrupted = threading.Event()
+        planner = GraspPlanner(NoopRobot(), GraspConfig(), interrupted)
+        moves = []
+        opens = []
+
+        def move_j(_joints, _duration, label, **_kwargs):
+            moves.append(label)
+            if label == "PUT1":
+                interrupted.set()
+
+        planner.move_j = move_j
+        planner.open_gripper = lambda ignore_interrupt=False: opens.append(
+            ignore_interrupt
+        ) or True
+
+        self.assertTrue(planner.finish_place_sequence())
+        self.assertEqual(moves, ["HOME", "PUT1"])
+        self.assertEqual(opens, [True])
 
     def test_obb_and_graspnet_share_workspace_validation(self):
         planner = GraspPlanner(NoopRobot(), GraspConfig(), threading.Event())

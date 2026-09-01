@@ -51,6 +51,7 @@ class GraspPlanner:
         self.voice = voice
         self.lifecycle_state = RobotLifecycleState.OWNED
         self._last_command: np.ndarray | None = None
+        self._sdk_lock = threading.RLock()
         self._shutdown_lock = threading.Lock()
         self._shutdown_complete = False
         self._shutdown_succeeded = False
@@ -75,18 +76,77 @@ class GraspPlanner:
 
     @contextlib.contextmanager
     def sdk_call(self):
-        old_mask = None
-        if threading.current_thread() is threading.main_thread() and hasattr(
-            signal, "pthread_sigmask"
-        ):
-            old_mask = signal.pthread_sigmask(
-                signal.SIG_BLOCK, {signal.SIGINT, signal.SIGTERM}
-            )
+        with self._sdk_lock:
+            old_mask = None
+            if threading.current_thread() is threading.main_thread() and hasattr(
+                signal, "pthread_sigmask"
+            ):
+                old_mask = signal.pthread_sigmask(
+                    signal.SIG_BLOCK, {signal.SIGINT, signal.SIGTERM}
+                )
+            try:
+                yield
+            finally:
+                if old_mask is not None:
+                    signal.pthread_sigmask(signal.SIG_SETMASK, old_mask)
+
+    @contextlib.contextmanager
+    def hold_current_pose(self, label):
+        """Refresh a stationary six-axis hold while camera work is blocking."""
+        command = getattr(self.robot, "Joint_Pos_Vel", None)
+        if not callable(command):
+            # Lightweight offline fakes do not expose motor commands.
+            yield None
+            return
+
+        target = np.asarray(self.current_joint_position(), dtype=float)
+        stop_event = threading.Event()
+        failures = []
+        period = float(self.config.stationary_hold_period_s)
+
+        def refresh_hold():
+            next_tick = time.monotonic()
+            while not stop_event.is_set() and not self.interrupted.is_set():
+                try:
+                    with self.sdk_call():
+                        result = command(
+                            target.tolist(),
+                            [0.0] * 6,
+                            self.config.max_torque,
+                            iswait=False,
+                        )
+                    if result is False:
+                        failures.append("position-hold command was rejected")
+                        return
+                except Exception as exc:  # pragma: no cover - hardware boundary
+                    failures.append(repr(exc))
+                    return
+                next_tick += period
+                stop_event.wait(max(0.0, next_tick - time.monotonic()))
+
+        worker = threading.Thread(
+            target=refresh_hold,
+            name=f"arm-hold-{label}",
+            daemon=True,
+        )
+        print(f"[HOLD] maintaining {label} pose at {1.0 / period:.1f} Hz ...")
+        worker.start()
         try:
-            yield
+            yield target
         finally:
-            if old_mask is not None:
-                signal.pthread_sigmask(signal.SIG_SETMASK, old_mask)
+            stop_event.set()
+            worker.join(timeout=max(1.0, 4.0 * period))
+        if worker.is_alive():
+            raise RuntimeError(f"{label} position-hold worker did not stop")
+        if failures:
+            raise RuntimeError(f"{label} position hold failed: {failures[0]}")
+        actual = np.asarray(self.current_joint_position(), dtype=float)
+        drift = float(np.max(np.abs(actual - target)))
+        print(f"[HOLD] {label} released: joint_drift={drift:.4f} rad")
+        if drift > self.config.stationary_hold_max_drift_rad:
+            raise RuntimeError(
+                f"{label} drifted {drift:.4f} rad while awaiting camera data"
+            )
 
     def sleep_interruptible(self, seconds):
         deadline = time.monotonic() + seconds
@@ -294,8 +354,11 @@ class GraspPlanner:
         self.lifecycle_state = RobotLifecycleState.HOMED
         self._say("机械臂已回到初始位置")
 
-    def open_gripper(self):
+    def open_gripper(self, ignore_interrupt=False):
         cfg = self.config
+        hold_joints = None
+        if callable(getattr(self.robot, "Joint_Pos_Vel", None)):
+            hold_joints = np.asarray(self.current_joint_position(), dtype=float)
         with self.sdk_call():
             result = self.robot.gripper_control(
                 cfg.gripper_open_position,
@@ -307,8 +370,18 @@ class GraspPlanner:
         deadline = time.monotonic() + cfg.gripper_open_timeout
         last_position = float("nan")
         while time.monotonic() < deadline:
-            if self.interrupted.is_set():
+            if self.interrupted.is_set() and not ignore_interrupt:
                 return False
+            if hold_joints is not None:
+                with self.sdk_call():
+                    hold_result = self.robot.Joint_Pos_Vel(
+                        hold_joints.tolist(),
+                        [0.0] * 6,
+                        cfg.max_torque,
+                        iswait=False,
+                    )
+                if hold_result is False:
+                    raise RuntimeError("arm hold rejected while opening gripper")
             with self.sdk_call():
                 last_position, _ = self.robot.gripper_state()
             if abs(last_position - cfg.gripper_open_position) <= cfg.gripper_open_position_tolerance:
@@ -791,7 +864,9 @@ class GraspPlanner:
         ):
             raise RuntimeError("Cartesian endpoint orientation is inaccurate")
         print(
-            f"[PREGRASP] Cartesian approach verified: travel={axial:.3f} m, "
+            "[PREGRASP] Cartesian approach verified: "
+            f"delta_xyz={np.round(path_vector * 1000.0, 1)} mm, "
+            f"travel={axial:.3f} m, "
             f"samples={len(trajectory)}, endpoint_error={endpoint_error:.4f} m, "
             f"segment_cross_track_max={max_path_cross_track:.4f} m, "
             f"approach_lateral_max={max_remaining_lateral:.4f} m"
@@ -942,27 +1017,54 @@ class GraspPlanner:
         print(
             "[PREGRASP] bounded Cartesian realignment verified: "
             f"axial={axial:.3f} m, lateral={lateral:.3f} m, "
+            f"correction_xyz={np.round(correction * 1000.0, 1)} mm, "
             f"correction={correction_norm:.3f} m, samples={len(trajectory)}"
         )
         return trajectory
 
+    def validate_trajectory_start(self, trajectory, label):
+        """Reject a stale plan if feedback moved after its first sample."""
+        cfg = self.config
+        expected = np.asarray(trajectory[0], dtype=float)
+        actual = np.asarray(self.current_joint_position(), dtype=float)
+        joint_gap = float(np.max(np.abs(actual - expected)))
+        expected_tool, _ = self.current_tool_pose(expected)
+        actual_tool, _ = self.current_tool_pose(actual)
+        tcp_gap = float(np.linalg.norm(actual_tool - expected_tool))
+        print(
+            f"[{label}] start feedback: joint_gap={joint_gap:.4f} rad, "
+            f"tcp_gap={tcp_gap * 1000.0:.1f} mm"
+        )
+        if (
+            joint_gap > cfg.trajectory_start_joint_tolerance_rad
+            or tcp_gap > cfg.trajectory_start_tcp_tolerance_m
+        ):
+            raise RuntimeError(
+                f"{label} plan is stale before execution: "
+                f"joint_gap={joint_gap:.4f} rad, tcp_gap={tcp_gap:.4f} m"
+            )
+
     def execute_pre_grasp_realignment(self, trajectory):
+        self.validate_trajectory_start(trajectory, "PRE GRASP CARTESIAN REALIGNMENT")
         with self.sdk_call():
             self.robot.execute_joint_trajectory_checked(
                 trajectory,
                 duration=self.config.pre_grasp_realign_duration,
                 max_torque=self.config.max_torque,
                 label="PRE GRASP CARTESIAN REALIGNMENT",
+                control_period=self.config.trajectory_control_period_s,
             )
         self._remember_command(trajectory[-1])
 
     def execute_cartesian_approach(self, trajectory):
+        self.validate_trajectory_start(trajectory, "FINAL CARTESIAN APPROACH")
         with self.sdk_call():
             self.robot.execute_joint_trajectory_checked(
                 trajectory,
                 duration=self.config.direct_grasp_duration,
                 max_torque=self.config.max_torque,
                 label="FINAL CARTESIAN APPROACH",
+                control_period=self.config.trajectory_control_period_s,
             )
         self._remember_command(trajectory[-1])
 
@@ -972,12 +1074,14 @@ class GraspPlanner:
         approach_trajectory,
         streamer=None,
         found=None,
+        gripper_preopened=False,
     ):
         cfg = self.config
-        print("[GRASP] opening gripper before direct grasp ...")
-        self.open_gripper()
-        if self.interrupted.is_set():
-            return False, float("nan"), float("nan")
+        if not gripper_preopened:
+            print("[GRASP] opening gripper before direct grasp ...")
+            self.open_gripper()
+            if self.interrupted.is_set():
+                return False, float("nan"), float("nan")
 
         print("[GRASP] executing validated Cartesian final approach ...")
         self.execute_cartesian_approach(approach_trajectory)
@@ -1097,18 +1201,21 @@ class GraspPlanner:
     def finish_place_sequence(self):
         cfg = self.config
 
+        # Once force confirms a grasp, do not strand the object in the gripper
+        # if a web-stop arrives during placement.  Finish the validated path to
+        # PUT1 and release, then honour the stop before optional PUT2 motion.
         print("[GRASP] returning to HOME while holding the object ...")
         self.move_j(cfg.home, cfg.return_home_duration, "HOME")
-        if self.interrupted.is_set():
-            return False
         print(f"[PUT1] moving HOME -> PUT1 while holding: {np.round(cfg.put1, 3)}")
         self.move_j(cfg.put1, cfg.put1_duration, "PUT1")
-        if self.interrupted.is_set():
-            return False
         print("[PUT1] opening gripper fully to release the object ...")
-        self.open_gripper()
+        self.open_gripper(ignore_interrupt=True)
         if self.interrupted.is_set():
-            return False
+            print(
+                "[PUT1] stop requested during placement; object released "
+                "safely and PUT2 skipped."
+            )
+            return True
         self._say("物体已放置")
         print(f"[PUT2] moving to PUT2 with gripper open: {np.round(cfg.put2, 3)}")
         self.move_j(cfg.put2, cfg.put2_duration, "PUT2")
@@ -1849,6 +1956,9 @@ class GraspPlanner:
         points = np.asarray([item["base_point"] for item in observations], dtype=float)
         refined_base = np.median(points, axis=0)
         spread = float(np.max(np.linalg.norm(points - refined_base, axis=1)))
+        raw_correction = refined_base - expected_base
+        if position_only and cfg.close_refine_preserve_base_y:
+            refined_base[1] = expected_base[1]
         correction = refined_base - expected_base
         correction_xy = float(np.linalg.norm(correction[:2]))
         correction_z = abs(float(correction[2]))
@@ -1877,6 +1987,13 @@ class GraspPlanner:
             f"[{stage}] correction={np.round(correction, 4)} m, "
             f"spread={spread:.3f} m"
         )
+        if position_only and cfg.close_refine_preserve_base_y:
+            print(
+                f"[{stage}] raw measured correction="
+                f"{np.round(raw_correction * 1000.0, 1)} mm; "
+                "Base-Y is preserved because the physical check found no "
+                "repeatable Y bias."
+            )
         if (
             spread > spread_limit
             or correction_xy > xy_limit
@@ -2130,19 +2247,20 @@ class GraspPlanner:
                 cfg.pre_grasp_duration,
                 "CAMERA OBSERVATION",
             )
-        if not self.sleep_interruptible(cfg.pre_grasp_camera_settle_time):
-            return None
-        print(
-            "[REFINE] acquiring several coherent RGB-D observations before "
-            "choosing the final grasp pose ..."
-        )
-        return self.refine_target_at_observation_pose(
-            camera_feed,
-            intrinsic,
-            tcp_camera,
-            selected_color,
-            found,
-        )
+        with self.hold_current_pose("far-field RGB-D refinement"):
+            if not self.sleep_interruptible(cfg.pre_grasp_camera_settle_time):
+                return None
+            print(
+                "[REFINE] acquiring several coherent RGB-D observations before "
+                "choosing the final grasp pose ..."
+            )
+            return self.refine_target_at_observation_pose(
+                camera_feed,
+                intrinsic,
+                tcp_camera,
+                selected_color,
+                found,
+            )
 
     def _return_to_recognition_pose(self, scan_joints, streamer, reason):
         """Recover from an empty grasp without terminating the operator loop."""
@@ -2261,10 +2379,11 @@ class GraspPlanner:
                             "ADAPTIVE PRE GRASP",
                             position_tolerance=cfg.pre_grasp_joint_tolerance_rad,
                         )
-                        if not self.sleep_interruptible(
-                            cfg.pre_grasp_camera_settle_time
-                        ):
-                            return False
+                        with self.hold_current_pose("pre-grasp settle"):
+                            if not self.sleep_interruptible(
+                                cfg.pre_grasp_camera_settle_time
+                            ):
+                                return False
                     realignment_trajectory = self.plan_pre_grasp_realignment(found)
                     if realignment_trajectory is not None:
                         print(
@@ -2272,23 +2391,25 @@ class GraspPlanner:
                             "safe standoff before the final approach ..."
                         )
                         self.execute_pre_grasp_realignment(realignment_trajectory)
-                        if not self.sleep_interruptible(
-                            cfg.pre_grasp_camera_settle_time
-                        ):
-                            return False
+                        with self.hold_current_pose("pre-grasp realignment settle"):
+                            if not self.sleep_interruptible(
+                                cfg.pre_grasp_camera_settle_time
+                            ):
+                                return False
                     if cfg.close_refine_enabled and not cfg.use_graspnet:
                         print(
                             "[CLOSE-REFINE] acquiring a bounded position-only "
                             "RGB-D correction at the safe standoff ..."
                         )
-                        close_refined = self.refine_target_at_observation_pose(
-                            camera_feed,
-                            intrinsic,
-                            tcp_camera,
-                            selected_color,
-                            found,
-                            position_only=True,
-                        )
+                        with self.hold_current_pose("close-range RGB-D refinement"):
+                            close_refined = self.refine_target_at_observation_pose(
+                                camera_feed,
+                                intrinsic,
+                                tcp_camera,
+                                selected_color,
+                                found,
+                                position_only=True,
+                            )
                         if close_refined is None:
                             print(
                                 "[CLOSE-REFINE] close image is incomplete or "
@@ -2309,10 +2430,20 @@ class GraspPlanner:
                             close_realignment = self.plan_pre_grasp_realignment(found)
                             if close_realignment is not None:
                                 self.execute_pre_grasp_realignment(close_realignment)
-                                if not self.sleep_interruptible(
-                                    cfg.pre_grasp_camera_settle_time
+                                with self.hold_current_pose(
+                                    "close-range realignment settle"
                                 ):
-                                    return False
+                                    if not self.sleep_interruptible(
+                                        cfg.pre_grasp_camera_settle_time
+                                    ):
+                                        return False
+                    print(
+                        "[GRASP] opening gripper while holding the validated "
+                        "pre-grasp pose ..."
+                    )
+                    self.open_gripper()
+                    if self.interrupted.is_set():
+                        return False
                     print(
                         "[PREGRASP] waypoint aligned; validating the straight "
                         "final approach ..."
@@ -2335,6 +2466,7 @@ class GraspPlanner:
                     approach_trajectory,
                     streamer=streamer,
                     found=found,
+                    gripper_preopened=True,
                 )
                 if not clamped:
                     print("[GRASP] clamp failed; releasing for another target.")
