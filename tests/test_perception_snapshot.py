@@ -6,6 +6,7 @@ import cv2
 
 from Panthera_lib.grasp_config import GraspConfig
 from Panthera_lib.vision_pipeline import (
+    _detection_from_result,
     CameraFeed,
     classify_color,
     classify_color_evidence,
@@ -59,6 +60,33 @@ class PerceptionSnapshotTests(unittest.TestCase):
         self.assertAlmostEqual(surface["depth_m"], 0.45, places=3)
         self.assertLess(surface["pixel"][1], 8.0)
         self.assertGreaterEqual(surface["depth_samples"], config.depth_min_surface_pixels)
+
+    def test_grasp_ray_uses_obb_centre_instead_of_nearest_tail_pixels(self):
+        config = GraspConfig()
+        image = np.zeros((80, 120, 3), dtype=np.uint8)
+        image[20:60, 20:100] = [0, 0, 255]
+        mask = np.zeros((80, 120), dtype=np.uint8)
+        mask[20:60, 20:100] = 1
+        depth = np.full((80, 120), 700, dtype=np.uint16)
+        depth[20:60, 20:60] = 450
+        depth[20:60, 60:100] = 550
+
+        detection = _detection_from_result(
+            "Lego brick",
+            0.9,
+            (20, 20, 100, 60),
+            mask,
+            image,
+            depth,
+            0.001,
+            config,
+        )
+
+        self.assertIsNotNone(detection)
+        self.assertTrue(np.allclose(detection["pixel"], [59.5, 39.5], atol=1.0))
+        self.assertLess(detection["depth_pixel"][0], detection["pixel"][0])
+        self.assertGreater(detection["grasp_center_shift_px"], 8.0)
+        self.assertAlmostEqual(detection["depth_m"], 0.45, places=3)
 
     def test_screenshot_calibrated_yellow_green_boundary(self):
         config = GraspConfig()

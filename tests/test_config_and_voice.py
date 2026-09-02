@@ -72,6 +72,8 @@ class ConfigAndVoiceTests(unittest.TestCase):
         self.assertEqual(config.close_refine_max_z_correction_m, 0.018)
         self.assertEqual(config.close_refine_max_total_correction_m, 0.035)
         self.assertEqual(config.trajectory_control_period_s, 0.020)
+        self.assertEqual(config.direct_grasp_duration, 3.5)
+        self.assertEqual(config.grasp_retry_retreat_duration, 2.0)
         self.assertEqual(config.direct_grasp_joint_tolerance_rad, 0.050)
         self.assertEqual(config.direct_grasp_tcp_tolerance_m, 0.012)
         self.assertEqual(config.pre_grasp_lateral_tolerance_m, 0.015)

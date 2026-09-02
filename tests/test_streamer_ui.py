@@ -27,6 +27,17 @@ class StreamerUiTests(unittest.TestCase):
 
         self.assertFalse(streamer.control_status()["accepting_targets"])
 
+    def test_completed_target_is_cleared_before_next_prompt(self):
+        streamer = VisionStreamer()
+        streamer.set_selected_color("red")
+        self.assertEqual(streamer.control_status()["selected_color"], "red")
+
+        streamer.clear_selected_target("ready for next target")
+
+        status = streamer.control_status()
+        self.assertIsNone(status["selected_color"])
+        self.assertEqual(status["message"], "ready for next target")
+
     def test_control_page_has_idle_joint1_jog_without_checkbox(self):
         self.assertIn("/api/target", _INDEX_HTML)
         self.assertIn("/api/stop", _INDEX_HTML)

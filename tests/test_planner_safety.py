@@ -963,6 +963,71 @@ class PlannerSafetyTests(unittest.TestCase):
 
         self.assertGreaterEqual(robot.commands, 3)
 
+    def test_cartesian_hold_stays_in_mit_mode(self):
+        class Robot:
+            def __init__(self):
+                self.mit_commands = 0
+
+            @staticmethod
+            def current_joint_position():
+                return np.zeros(6)
+
+            def hold_joints_mit_once(self, joints, _max_torque):
+                self.mit_commands += 1
+                self.asserted_target = np.asarray(joints, dtype=float)
+                return True
+
+            @staticmethod
+            def Joint_Pos_Vel(*_args, **_kwargs):
+                raise AssertionError("MIT trajectory hold must not switch controllers")
+
+        robot = Robot()
+        config = GraspConfig()
+        config.stationary_hold_period_s = 0.02
+        planner = GraspPlanner(robot, config, threading.Event())
+        planner._control_mode = "mit"
+        planner._remember_command(np.zeros(6))
+
+        with planner.hold_current_pose("test MIT continuity"):
+            threading.Event().wait(0.07)
+
+        self.assertGreaterEqual(robot.mit_commands, 3)
+        self.assertTrue(np.allclose(robot.asserted_target, 0.0))
+
+    def test_retry_retreat_reverses_only_outward_cartesian_samples(self):
+        class Robot:
+            jump_threshold = 1.5
+
+            @staticmethod
+            def current_joint_position():
+                return np.array([0.294, 0.0, 0.0, 0.0, 0.0, 0.0])
+
+            @staticmethod
+            def forward_kinematics(joints):
+                return {
+                    "position": np.array([float(joints[0]) - 0.165, 0.0, 0.10]),
+                    "rotation": np.eye(3),
+                }
+
+        planner = GraspPlanner(Robot(), GraspConfig(), threading.Event())
+        original = []
+        for x in np.linspace(0.260, 0.300, 5):
+            joints = np.zeros(6)
+            joints[0] = x
+            original.append(joints)
+        found = {
+            "tool_target": np.array([0.300, 0.0, 0.10]),
+            "tool_rotation": np.eye(3),
+            "approach_standoff_m": 0.040,
+        }
+
+        retreat = planner.plan_retry_retreat(original, found)
+        axial_gaps = [0.300 - float(joints[0]) for joints in retreat]
+
+        self.assertTrue(np.allclose(retreat[0], Robot.current_joint_position()))
+        self.assertTrue(np.all(np.diff(axial_gaps) >= -1e-9))
+        self.assertAlmostEqual(axial_gaps[-1], 0.040, places=3)
+
     def test_stale_cartesian_start_is_rejected_before_motor_execution(self):
         class Robot:
             @staticmethod
@@ -983,7 +1048,22 @@ class PlannerSafetyTests(unittest.TestCase):
                 "TEST TRAJECTORY",
             )
 
-    def test_stop_during_put1_still_releases_before_skipping_put2(self):
+    def test_successful_place_follows_put2_put1_release_put2_home_order(self):
+        planner = GraspPlanner(NoopRobot(), GraspConfig(), threading.Event())
+        moves = []
+        opens = []
+        planner.move_j = lambda _joints, _duration, label, **_kwargs: moves.append(
+            label
+        )
+        planner.open_gripper = lambda ignore_interrupt=False: opens.append(
+            ignore_interrupt
+        ) or True
+
+        self.assertTrue(planner.finish_place_sequence())
+        self.assertEqual(moves, ["PUT2", "PUT1", "PUT2", "READY HOME"])
+        self.assertEqual(opens, [True])
+
+    def test_stop_during_put1_still_releases_before_skipping_ready_home(self):
         interrupted = threading.Event()
         planner = GraspPlanner(NoopRobot(), GraspConfig(), interrupted)
         moves = []
@@ -1000,8 +1080,118 @@ class PlannerSafetyTests(unittest.TestCase):
         ) or True
 
         self.assertTrue(planner.finish_place_sequence())
-        self.assertEqual(moves, ["HOME", "PUT1"])
+        self.assertEqual(moves, ["PUT2", "PUT1"])
         self.assertEqual(opens, [True])
+
+    def test_successful_cycle_returns_home_and_waits_for_another_target(self):
+        config = GraspConfig()
+        config.close_refine_enabled = False
+        planner = GraspPlanner(NoopRobot(), config, threading.Event())
+        found = {"scan_joint_position": np.zeros(6)}
+        selected = iter(["red", False])
+        finished = []
+
+        class Streamer:
+            def __init__(self):
+                self.selected = []
+                self.cleared = []
+
+            def set_selected_color(self, color):
+                self.selected.append(color)
+
+            def clear_selected_target(self, message):
+                self.cleared.append(message)
+
+            def set_control_message(self, _message):
+                pass
+
+        streamer = Streamer()
+        planner.scan_for_target = lambda *_args: found
+        planner.pre_grasp_and_redetect = lambda *_args: found
+        planner.plan_pre_grasp = lambda _found: None
+        planner.plan_pre_grasp_realignment = lambda _found: None
+        planner.open_gripper = lambda *args, **kwargs: True
+        planner.plan_cartesian_approach = lambda _found: [
+            np.zeros(6),
+            np.full(6, 0.01),
+        ]
+        planner.grasp_and_close = lambda *args, **kwargs: (
+            True,
+            0.3,
+            config.grasp_min_force,
+        )
+        planner.finish_place_sequence = lambda: finished.append(True) or True
+
+        result = planner.run_grasp_loop(
+            None,
+            None,
+            None,
+            streamer,
+            lambda: next(selected),
+        )
+
+        self.assertFalse(result)
+        self.assertEqual(finished, [True])
+        self.assertEqual(streamer.selected, ["red"])
+        self.assertEqual(len(streamer.cleared), 1)
+
+    def test_exhausted_pregrasp_retry_returns_home_before_next_target(self):
+        config = GraspConfig()
+        config.close_refine_enabled = False
+        planner = GraspPlanner(NoopRobot(), config, threading.Event())
+        found = {"scan_joint_position": np.zeros(6)}
+        selected = iter(["red", False])
+        moves = []
+        redetections = []
+        grasp_attempts = []
+
+        class Streamer:
+            def __init__(self):
+                self.cleared = []
+
+            def set_selected_color(self, _color):
+                pass
+
+            def set_control_message(self, _message):
+                pass
+
+            def clear_selected_target(self, message):
+                self.cleared.append(message)
+
+        streamer = Streamer()
+        planner.scan_for_target = lambda *_args: found
+        planner.pre_grasp_and_redetect = lambda *_args: found
+        planner.redetect_at_pre_grasp = lambda *_args: (
+            redetections.append(True) or found
+        )
+        planner.plan_pre_grasp = lambda _found: None
+        planner.plan_pre_grasp_realignment = lambda _found: None
+        planner.open_gripper = lambda *args, **kwargs: True
+        planner.plan_cartesian_approach = lambda _found: [
+            np.zeros(6),
+            np.full(6, 0.01),
+        ]
+        planner.grasp_and_close = lambda *args, **kwargs: (
+            grasp_attempts.append(True) or (False, float("nan"), float("nan"))
+        )
+        planner._prepare_pregrasp_retry = lambda *_args: True
+        planner.move_j = lambda _joints, _duration, label, **_kwargs: moves.append(
+            label
+        )
+
+        result = planner.run_grasp_loop(
+            None,
+            None,
+            None,
+            streamer,
+            lambda: next(selected),
+        )
+
+        self.assertFalse(result)
+        self.assertEqual(len(grasp_attempts), 2)
+        self.assertEqual(len(redetections), 1)
+        self.assertEqual(moves, ["READY HOME"])
+        self.assertEqual(len(streamer.cleared), 1)
 
     def test_obb_and_graspnet_share_workspace_validation(self):
         planner = GraspPlanner(NoopRobot(), GraspConfig(), threading.Event())

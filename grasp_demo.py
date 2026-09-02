@@ -336,7 +336,7 @@ def main():
         safe_print("[INIT] opening gripper at HOME ...")
         planner.open_gripper()
 
-        task_complete = planner.run_grasp_loop(
+        planner.run_grasp_loop(
             camera_feed,
             intrinsic,
             tcp_camera,
@@ -347,8 +347,6 @@ def main():
                 planner.jog_joint1,
             ),
         )
-        if task_complete:
-            safe_print("[GRASP] scan, grasp and placement completed; returning to ZERO.")
     except Exception as exc:
         safe_print(f"[MAIN] exception: {exc!r}")
         exit_code = 1

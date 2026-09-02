@@ -1360,6 +1360,36 @@ class Panthera(htr.Robot):  # 继承自htr.Robot
 
         return success
 
+    def _send_mit_position_command(self, position, velocity, max_tqu=None):
+        """Send one gravity-compensated MIT command with the trajectory gains."""
+        if max_tqu is None:
+            if hasattr(self, 'max_torque'):
+                max_tqu = self.max_torque
+            else:
+                max_tqu = np.array([21.0, 36.0, 36.0, 21.0, 10.0, 10.0])
+        kp = [30.0, 50.0, 60.0, 25.0, 15.0, 10.0]
+        kd = [3.0, 5.0, 6.0, 2.5, 1.5, 1.0]
+        tqe = np.asarray(self.get_Gravity(position))
+        tqe = np.clip(tqe, -np.asarray(max_tqu), np.asarray(max_tqu))
+        return self.pos_vel_tqe_kp_kd(
+            pos=position,
+            vel=velocity,
+            tqe=tqe,
+            kp=kp,
+            kd=kd,
+        )
+
+    def hold_joints_mit_once(self, joints, max_torque):
+        """Refresh a stationary pose without leaving the active MIT mode."""
+        joints = np.asarray(joints, dtype=float)
+        if joints.shape != (self.motor_count,) or not np.all(np.isfinite(joints)):
+            raise RuntimeError("MIT hold target is invalid")
+        return self._send_mit_position_command(
+            joints.tolist(),
+            [0.0] * self.motor_count,
+            max_torque,
+        )
+
     def _execute_trajectory(self, joint_trajectory, timestamps, velocities, max_tqu=None):
         """
         执行轨迹（使用 MIT 模式 + 重力补偿）
@@ -1370,9 +1400,6 @@ class Panthera(htr.Robot):  # 继承自htr.Robot
                 max_tqu = self.max_torque
             else:
                 max_tqu = np.array([21.0, 36.0, 36.0, 21.0, 10.0, 10.0])
-
-        kp = [30.0, 50.0, 60.0, 25.0, 15.0, 10.0]
-        kd = [3.0, 5.0, 6.0, 2.5, 1.5, 1.0]
 
         start_time = time.perf_counter()
         max_dispatch_lateness = 0.0
@@ -1409,15 +1436,11 @@ class Panthera(htr.Robot):  # 继承自htr.Robot
             #     iswait=False
             # )
 
-            # 使用 MIT 模式发送控制指令
-            tqe = np.asarray(self.get_Gravity(joint_trajectory[i]))
-            tqe = np.clip(tqe, -np.asarray(max_tqu), np.asarray(max_tqu))
-            success = self.pos_vel_tqe_kp_kd(
-                pos=joint_trajectory[i],
-                vel=velocities[i],
-                tqe=tqe,
-                kp=kp,
-                kd=kd
+            # 使用与静止保持相同的 MIT 模式，避免轨迹末端切换控制器。
+            success = self._send_mit_position_command(
+                joint_trajectory[i],
+                velocities[i],
+                max_tqu,
             )
 
             if not success:

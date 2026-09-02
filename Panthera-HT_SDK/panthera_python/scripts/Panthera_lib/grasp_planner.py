@@ -51,6 +51,7 @@ class GraspPlanner:
         self.voice = voice
         self.lifecycle_state = RobotLifecycleState.OWNED
         self._last_command: np.ndarray | None = None
+        self._control_mode = "joint_pos_vel"
         self._sdk_lock = threading.RLock()
         self._shutdown_lock = threading.Lock()
         self._shutdown_complete = False
@@ -93,13 +94,19 @@ class GraspPlanner:
     @contextlib.contextmanager
     def hold_current_pose(self, label):
         """Refresh a stationary six-axis hold while camera work is blocking."""
-        command = getattr(self.robot, "Joint_Pos_Vel", None)
-        if not callable(command):
+        joint_command = getattr(self.robot, "Joint_Pos_Vel", None)
+        mit_command = getattr(self.robot, "hold_joints_mit_once", None)
+        use_mit = self._control_mode == "mit" and callable(mit_command)
+        if not use_mit and not callable(joint_command):
             # Lightweight offline fakes do not expose motor commands.
             yield None
             return
 
-        target = np.asarray(self.current_joint_position(), dtype=float)
+        target = np.asarray(
+            self._last_command if use_mit and self._last_command is not None
+            else self.current_joint_position(),
+            dtype=float,
+        )
         stop_event = threading.Event()
         failures = []
         period = float(self.config.stationary_hold_period_s)
@@ -109,12 +116,15 @@ class GraspPlanner:
             while not stop_event.is_set() and not self.interrupted.is_set():
                 try:
                     with self.sdk_call():
-                        result = command(
-                            target.tolist(),
-                            [0.0] * 6,
-                            self.config.max_torque,
-                            iswait=False,
-                        )
+                        if use_mit:
+                            result = mit_command(target, self.config.max_torque)
+                        else:
+                            result = joint_command(
+                                target.tolist(),
+                                [0.0] * 6,
+                                self.config.max_torque,
+                                iswait=False,
+                            )
                     if result is False:
                         failures.append("position-hold command was rejected")
                         return
@@ -129,7 +139,11 @@ class GraspPlanner:
             name=f"arm-hold-{label}",
             daemon=True,
         )
-        print(f"[HOLD] maintaining {label} pose at {1.0 / period:.1f} Hz ...")
+        mode_label = "MIT" if use_mit else "Joint_Pos_Vel"
+        print(
+            f"[HOLD] maintaining {label} pose with {mode_label} "
+            f"at {1.0 / period:.1f} Hz ..."
+        )
         worker.start()
         try:
             yield target
@@ -146,6 +160,20 @@ class GraspPlanner:
         if drift > self.config.stationary_hold_max_drift_rad:
             raise RuntimeError(
                 f"{label} drifted {drift:.4f} rad while awaiting camera data"
+            )
+
+    def refresh_arm_hold(self, joints):
+        """Refresh the arm without switching away from its active controller."""
+        joints = np.asarray(joints, dtype=float)
+        with self.sdk_call():
+            mit_command = getattr(self.robot, "hold_joints_mit_once", None)
+            if self._control_mode == "mit" and callable(mit_command):
+                return mit_command(joints, self.config.max_torque)
+            return self.robot.Joint_Pos_Vel(
+                joints.tolist(),
+                [0.0] * 6,
+                self.config.max_torque,
+                iswait=False,
             )
 
     def sleep_interruptible(self, seconds):
@@ -332,6 +360,7 @@ class GraspPlanner:
             f"[MOVE] {label}: completed in {time.monotonic() - started:.2f}s.",
             flush=True,
         )
+        self._control_mode = "joint_pos_vel"
         self._remember_command(joints)
         if self.lifecycle_state not in {
             RobotLifecycleState.STOPPING,
@@ -350,15 +379,24 @@ class GraspPlanner:
             )
         if result is False:
             raise RuntimeError("HOME move failed")
+        self._control_mode = "joint_pos_vel"
         self._remember_command(self.config.home)
         self.lifecycle_state = RobotLifecycleState.HOMED
         self._say("机械臂已回到初始位置")
 
     def open_gripper(self, ignore_interrupt=False):
         cfg = self.config
+        can_hold = callable(getattr(self.robot, "Joint_Pos_Vel", None)) or callable(
+            getattr(self.robot, "hold_joints_mit_once", None)
+        )
         hold_joints = None
-        if callable(getattr(self.robot, "Joint_Pos_Vel", None)):
-            hold_joints = np.asarray(self.current_joint_position(), dtype=float)
+        if can_hold:
+            hold_joints = np.asarray(
+                self._last_command
+                if self._last_command is not None
+                else self.current_joint_position(),
+                dtype=float,
+            )
         with self.sdk_call():
             result = self.robot.gripper_control(
                 cfg.gripper_open_position,
@@ -373,13 +411,7 @@ class GraspPlanner:
             if self.interrupted.is_set() and not ignore_interrupt:
                 return False
             if hold_joints is not None:
-                with self.sdk_call():
-                    hold_result = self.robot.Joint_Pos_Vel(
-                        hold_joints.tolist(),
-                        [0.0] * 6,
-                        cfg.max_torque,
-                        iswait=False,
-                    )
+                hold_result = self.refresh_arm_hold(hold_joints)
                 if hold_result is False:
                     raise RuntimeError("arm hold rejected while opening gripper")
             with self.sdk_call():
@@ -432,13 +464,9 @@ class GraspPlanner:
             if self.interrupted.is_set():
                 return False, last_position, last_torque, "interrupted"
             if hold_joints is not None:
-                with self.sdk_call():
-                    self.robot.Joint_Pos_Vel(
-                        hold_joints.tolist(),
-                        [0.0] * 6,
-                        self.config.max_torque,
-                        iswait=False,
-                    )
+                hold_result = self.refresh_arm_hold(hold_joints)
+                if hold_result is False:
+                    return False, last_position, last_torque, "arm hold rejected"
             with self.sdk_call():
                 last_position, last_torque = self.robot.gripper_state()
             if force_callback is not None:
@@ -1054,6 +1082,7 @@ class GraspPlanner:
                 label="PRE GRASP CARTESIAN REALIGNMENT",
                 control_period=self.config.trajectory_control_period_s,
             )
+        self._control_mode = "mit"
         self._remember_command(trajectory[-1])
 
     def execute_cartesian_approach(self, trajectory):
@@ -1066,7 +1095,102 @@ class GraspPlanner:
                 label="FINAL CARTESIAN APPROACH",
                 control_period=self.config.trajectory_control_period_s,
             )
+        self._control_mode = "mit"
         self._remember_command(trajectory[-1])
+
+    def plan_retry_retreat(self, approach_trajectory, found):
+        """Build a feedback-anchored reverse path back to the pre-grasp point."""
+        cfg = self.config
+        original = [np.asarray(item, dtype=float) for item in approach_trajectory]
+        if len(original) < 2:
+            raise RuntimeError("retry retreat has no validated approach to reverse")
+
+        actual = np.asarray(self.current_joint_position(), dtype=float)
+        target_tool = np.asarray(found["tool_target"], dtype=float)
+        target_rotation = np.asarray(found["tool_rotation"], dtype=float)
+        approach = target_rotation[:, 0].astype(float)
+        approach /= np.linalg.norm(approach)
+        actual_tool, actual_rotation = self.current_tool_pose(actual)
+        actual_gap = float(np.dot(target_tool - actual_tool, approach))
+        if actual_gap < -0.003:
+            raise RuntimeError(
+                f"retry retreat starts beyond the grasp plane: axial={actual_gap:.4f} m"
+            )
+
+        standoff = float(
+            np.clip(
+                found.get("approach_standoff_m", cfg.pre_grasp_max_distance_m),
+                cfg.pre_grasp_min_distance_m,
+                cfg.pre_grasp_max_distance_m,
+            )
+        )
+        trajectory = [actual]
+        previous_gap = actual_gap
+        previous_joints = actual
+        max_lateral = 0.0
+        jump_limit = float(getattr(self.robot, "jump_threshold", 1.5))
+        for joints in reversed(original[:-1]):
+            tool, rotation = self.current_tool_pose(joints)
+            gap = float(np.dot(target_tool - tool, approach))
+            # The real endpoint can stop several millimetres before the
+            # software target.  Skip reversed samples that would first move
+            # closer to the object; retain only monotonically outward points.
+            if gap + 0.001 < previous_gap:
+                continue
+            if gap > standoff + 0.010:
+                raise RuntimeError(
+                    f"retry retreat exceeds safe standoff: axial={gap:.4f} m"
+                )
+            remaining = target_tool - tool
+            lateral = float(np.linalg.norm(remaining - gap * approach))
+            if lateral > cfg.pre_grasp_lateral_tolerance_m + 0.005:
+                raise RuntimeError(
+                    f"retry retreat leaves approach corridor: lateral={lateral:.4f} m"
+                )
+            joint6 = tool - rotation @ cfg.tcp_in_joint6
+            if not workspace_ok(tool, joint6, cfg):
+                raise RuntimeError("retry retreat leaves the workspace")
+            if self.rotation_error_deg(rotation, target_rotation) > (
+                cfg.pre_grasp_orientation_tolerance_deg
+            ):
+                raise RuntimeError("retry retreat changes the validated grasp attitude")
+            if float(np.max(np.abs(joints - previous_joints))) > jump_limit:
+                raise RuntimeError("retry retreat contains a joint jump")
+            trajectory.append(joints)
+            previous_gap = gap
+            previous_joints = joints
+            max_lateral = max(max_lateral, lateral)
+
+        if len(trajectory) < 2 or previous_gap < standoff - 0.006:
+            raise RuntimeError(
+                "retry retreat could not recover the validated pre-grasp standoff"
+            )
+        if self.rotation_error_deg(actual_rotation, target_rotation) > (
+            cfg.pre_grasp_orientation_tolerance_deg + 2.0
+        ):
+            raise RuntimeError("retry retreat starts with an invalid tool attitude")
+        print(
+            "[RETRY] reverse Cartesian retreat verified: "
+            f"axial={actual_gap * 1000.0:.1f}->{previous_gap * 1000.0:.1f} mm, "
+            f"lateral_max={max_lateral * 1000.0:.1f} mm, "
+            f"samples={len(trajectory)}"
+        )
+        return trajectory
+
+    def execute_retry_retreat(self, approach_trajectory, found):
+        trajectory = self.plan_retry_retreat(approach_trajectory, found)
+        self.validate_trajectory_start(trajectory, "RETRY CARTESIAN RETREAT")
+        with self.sdk_call():
+            self.robot.execute_joint_trajectory_checked(
+                trajectory,
+                duration=self.config.grasp_retry_retreat_duration,
+                max_torque=self.config.max_torque,
+                label="RETRY CARTESIAN RETREAT",
+                control_period=self.config.trajectory_control_period_s,
+            )
+        self._control_mode = "mit"
+        self._remember_command(trajectory[-1])
+        return trajectory[-1]
 
     def grasp_and_close(
         self,
@@ -1153,7 +1277,10 @@ class GraspPlanner:
             return False, float("nan"), float("nan")
 
         print("[GRASP] closing gripper while holding arm ...")
-        grasp_hold = self.current_joint_position()
+        # Continue commanding the validated final endpoint in the same MIT
+        # mode used by the approach.  Switching to Joint_Pos_Vel here caused
+        # the repeatable 0.039..0.041 rad / 2..3 cm physical drop in testing.
+        grasp_hold = np.asarray(final, dtype=float)
         clamped = False
         gpos = float("nan")
         gtor = float("nan")
@@ -1176,7 +1303,7 @@ class GraspPlanner:
                     "releasing and retrying ..."
                 )
                 self.open_gripper()
-                grasp_hold = self.current_joint_position()
+                grasp_hold = np.asarray(final, dtype=float)
             clamped, gpos, gtor, reason = self.close_gripper(
                 hold_joints=grasp_hold,
                 force_callback=publish_force,
@@ -1201,24 +1328,37 @@ class GraspPlanner:
     def finish_place_sequence(self):
         cfg = self.config
 
-        # Once force confirms a grasp, do not strand the object in the gripper
-        # if a web-stop arrives during placement.  Finish the validated path to
-        # PUT1 and release, then honour the stop before optional PUT2 motion.
-        print("[GRASP] returning to HOME while holding the object ...")
-        self.move_j(cfg.home, cfg.return_home_duration, "HOME")
-        print(f"[PUT1] moving HOME -> PUT1 while holding: {np.round(cfg.put1, 3)}")
+        # PUT2 is the validated transfer pose on both sides of the PUT1 drop
+        # pose.  Enter PUT2 while clamped, continue to PUT1 and release there,
+        # then leave through PUT2 with the gripper open before returning HOME.
+        # If a stop arrives while carrying the object, still reach PUT1 and
+        # release so the object is never stranded in the gripper at shutdown.
+        print(
+            f"[PUT2] moving grasp -> PUT2 while holding: "
+            f"{np.round(cfg.put2, 3)}"
+        )
+        self.move_j(cfg.put2, cfg.put2_duration, "PUT2")
+        print(f"[PUT1] moving PUT2 -> PUT1 while holding: {np.round(cfg.put1, 3)}")
         self.move_j(cfg.put1, cfg.put1_duration, "PUT1")
         print("[PUT1] opening gripper fully to release the object ...")
         self.open_gripper(ignore_interrupt=True)
         if self.interrupted.is_set():
             print(
                 "[PUT1] stop requested during placement; object released "
-                "safely and PUT2 skipped."
+                "safely and HOME return is delegated to shutdown."
             )
             return True
         self._say("物体已放置")
-        print(f"[PUT2] moving to PUT2 with gripper open: {np.round(cfg.put2, 3)}")
+        print(f"[PUT2] moving PUT1 -> PUT2 with gripper open: {np.round(cfg.put2, 3)}")
         self.move_j(cfg.put2, cfg.put2_duration, "PUT2")
+        if self.interrupted.is_set():
+            print(
+                "[PUT2] stop requested after release; HOME return is delegated "
+                "to shutdown."
+            )
+            return True
+        print("[READY] moving PUT2 -> HOME with gripper open ...")
+        self.move_j(cfg.home, cfg.return_home_duration, "READY HOME")
         return True
 
     def execute_grasp(self, final, approach_trajectory, streamer=None):
@@ -1706,6 +1846,14 @@ class GraspPlanner:
                 f"Pixel      : ({detection['pixel'][0]:.1f}, "
                 f"{detection['pixel'][1]:.1f})"
             )
+            if "depth_pixel" in detection:
+                print(
+                    "Depth pixel: "
+                    f"({detection['depth_pixel'][0]:.1f}, "
+                    f"{detection['depth_pixel'][1]:.1f}), "
+                    "OBB-centre correction="
+                    f"{detection.get('grasp_center_shift_px', 0.0):.1f} px"
+                )
             print(
                 f"Depth      : {detection['depth_m']:.3f} m, "
                 f"samples={detection.get('depth_samples', 0)}, "
@@ -2262,6 +2410,31 @@ class GraspPlanner:
                 found,
             )
 
+    def redetect_at_pre_grasp(
+        self,
+        camera_feed,
+        intrinsic,
+        tcp_camera,
+        selected_color,
+        found,
+    ):
+        """Reacquire the same object after a failed grasp and safe retreat."""
+        print(
+            "[RETRY] back at the validated pre-grasp point; acquiring a fresh "
+            "three-frame position estimate ..."
+        )
+        with self.hold_current_pose("retry pre-grasp RGB-D refinement"):
+            if not self.sleep_interruptible(self.config.pre_grasp_camera_settle_time):
+                return None
+            return self.refine_target_at_observation_pose(
+                camera_feed,
+                intrinsic,
+                tcp_camera,
+                selected_color,
+                found,
+                position_only=True,
+            )
+
     def _return_to_recognition_pose(self, scan_joints, streamer, reason):
         """Recover from an empty grasp without terminating the operator loop."""
         scan_joints = np.asarray(scan_joints, dtype=float)
@@ -2275,6 +2448,42 @@ class GraspPlanner:
             streamer.set_control_message(
                 f"{reason}。机械臂已回到识别位置，请选择下一个目标。"
             )
+
+    def _return_home_for_next_target(self, streamer, reason):
+        """Open the gripper and recover HOME after the bounded retry is exhausted."""
+        if self.interrupted.is_set():
+            return False
+        print(f"[RECOVERY] {reason}; opening gripper and returning HOME.")
+        self.open_gripper()
+        if self.interrupted.is_set():
+            return False
+        self.move_j(
+            self.config.home,
+            self.config.return_home_duration,
+            "READY HOME",
+        )
+        if streamer is not None:
+            clear_target = getattr(streamer, "clear_selected_target", None)
+            message = f"{reason}。机械臂已回到 HOME，请选择下一个目标。"
+            if callable(clear_target):
+                clear_target(message)
+            else:
+                streamer.set_control_message(message)
+        return True
+
+    def _prepare_pregrasp_retry(self, approach_trajectory, found, streamer, reason):
+        """Open, retreat along the validated line and keep the target active."""
+        self.open_gripper()
+        try:
+            self.execute_retry_retreat(approach_trajectory, found)
+        except RuntimeError as exc:
+            print(f"[RETRY] safe retreat to pre-grasp failed: {exc}")
+            return False
+        if streamer is not None:
+            streamer.set_control_message(
+                f"{reason}。机械臂已退回预抓取点，正在重新识别同一目标。"
+            )
+        return True
 
     def run_grasp_loop(
         self,
@@ -2312,45 +2521,69 @@ class GraspPlanner:
 
             retry_scan_position = found["scan_joint_position"]
             task_complete = False
+            retry_from_pregrasp = False
             for attempt in range(1, cfg.grasp_max_attempts + 1):
                 if self.interrupted.is_set():
                     return False
 
+                attempt_from_pregrasp = retry_from_pregrasp
+                retry_from_pregrasp = False
                 if attempt > 1:
-                    print("[RETRY] returning to scan pose and re-detecting ...")
-                    found = self.detect_once_at_position(
-                        camera_feed,
-                        intrinsic,
-                        tcp_camera,
-                        selected_color,
-                        retry_scan_position,
-                    )
+                    if attempt_from_pregrasp:
+                        found = self.redetect_at_pre_grasp(
+                            camera_feed,
+                            intrinsic,
+                            tcp_camera,
+                            selected_color,
+                            found,
+                        )
+                    else:
+                        print("[RETRY] returning to scan pose and re-detecting ...")
+                        found = self.detect_once_at_position(
+                            camera_feed,
+                            intrinsic,
+                            tcp_camera,
+                            selected_color,
+                            retry_scan_position,
+                        )
                     if self.interrupted.is_set():
                         return False
                     if found is None:
-                        self.open_gripper()
-                        self._return_to_recognition_pose(
-                            retry_scan_position,
-                            streamer,
-                            "重新识别失败",
-                        )
+                        if attempt_from_pregrasp:
+                            self._return_home_for_next_target(
+                                streamer,
+                                "预抓取点重新识别失败",
+                            )
+                        else:
+                            self.open_gripper()
+                            self._return_to_recognition_pose(
+                                retry_scan_position,
+                                streamer,
+                                "重新识别失败",
+                            )
                         break
 
-                try:
-                    if streamer is not None:
-                        streamer.set_control_message(
-                            "目标已锁定，正在计算观察位并进行多帧复检。"
+                if not attempt_from_pregrasp:
+                    try:
+                        if streamer is not None:
+                            streamer.set_control_message(
+                                "目标已锁定，正在计算观察位并进行多帧复检。"
+                            )
+                        found = self.pre_grasp_and_redetect(
+                            camera_feed,
+                            intrinsic,
+                            tcp_camera,
+                            selected_color,
+                            found,
                         )
-                    found = self.pre_grasp_and_redetect(
-                        camera_feed,
-                        intrinsic,
-                        tcp_camera,
-                        selected_color,
-                        found,
+                    except RuntimeError as exc:
+                        print(f"[OBSERVE] planning/re-detection failed safely: {exc}")
+                        found = None
+                elif found is not None:
+                    print(
+                        "[RETRY] fresh pre-grasp observation accepted; skipping "
+                        "the distant camera-observation move."
                     )
-                except RuntimeError as exc:
-                    print(f"[OBSERVE] planning/re-detection failed safely: {exc}")
-                    found = None
                 if self.interrupted.is_set():
                     return False
                 if found is None:
@@ -2396,7 +2629,11 @@ class GraspPlanner:
                                 cfg.pre_grasp_camera_settle_time
                             ):
                                 return False
-                    if cfg.close_refine_enabled and not cfg.use_graspnet:
+                    if (
+                        cfg.close_refine_enabled
+                        and not cfg.use_graspnet
+                        and not attempt_from_pregrasp
+                    ):
                         print(
                             "[CLOSE-REFINE] acquiring a bounded position-only "
                             "RGB-D correction at the safe standoff ..."
@@ -2451,12 +2688,18 @@ class GraspPlanner:
                     approach_trajectory = self.plan_cartesian_approach(found)
                 except RuntimeError as exc:
                     print(f"[PREGRASP] final approach rejected safely: {exc}")
-                    self.open_gripper()
-                    self._return_to_recognition_pose(
-                        retry_scan_position,
-                        streamer,
-                        "预抓取或直线接近规划失败",
-                    )
+                    if attempt_from_pregrasp:
+                        self._return_home_for_next_target(
+                            streamer,
+                            "第二次预抓取或直线接近规划失败",
+                        )
+                    else:
+                        self.open_gripper()
+                        self._return_to_recognition_pose(
+                            retry_scan_position,
+                            streamer,
+                            "预抓取或直线接近规划失败",
+                        )
                     break
                 final = np.asarray(approach_trajectory[-1], dtype=float)
                 print("[PLAN] full Cartesian approach verified; auto grasp starts now.")
@@ -2469,10 +2712,16 @@ class GraspPlanner:
                     gripper_preopened=True,
                 )
                 if not clamped:
-                    print("[GRASP] clamp failed; releasing for another target.")
-                    self.open_gripper()
-                    self._return_to_recognition_pose(
-                        retry_scan_position,
+                    print("[GRASP] clamp failed; preparing a pre-grasp retry.")
+                    if attempt < cfg.grasp_max_attempts and self._prepare_pregrasp_retry(
+                        approach_trajectory,
+                        found,
+                        streamer,
+                        "夹爪未形成有效夹持",
+                    ):
+                        retry_from_pregrasp = True
+                        continue
+                    self._return_home_for_next_target(
                         streamer,
                         "夹爪未抓到物体",
                     )
@@ -2494,20 +2743,47 @@ class GraspPlanner:
                     f"attempt={attempt}/{cfg.grasp_max_attempts}"
                 )
                 self._say("抓取力不足，重新尝试")
-                self.open_gripper()
+                if attempt < cfg.grasp_max_attempts and self._prepare_pregrasp_retry(
+                    approach_trajectory,
+                    found,
+                    streamer,
+                    "夹爪力不足",
+                ):
+                    retry_from_pregrasp = True
+                    continue
                 if attempt >= cfg.grasp_max_attempts:
                     print(
                         "[RETRY] second attempt still below threshold; "
-                        "returning to recognition pose and asking again."
+                        "returning HOME and asking again."
                     )
-                    self._return_to_recognition_pose(
-                        retry_scan_position,
+                    self._return_home_for_next_target(
                         streamer,
                         "夹爪力不足，未确认抓到物体",
                     )
+                else:
+                    self._return_home_for_next_target(
+                        streamer,
+                        "无法安全退回预抓取点",
+                    )
+                break
 
             if task_complete:
-                return True
+                if self.interrupted.is_set():
+                    return False
+                print(
+                    "[READY] placement completed; HOME is ready for the next "
+                    "target selection."
+                )
+                self._say("抓取完成，请选择下一个目标")
+                if streamer is not None:
+                    clear_target = getattr(streamer, "clear_selected_target", None)
+                    if callable(clear_target):
+                        clear_target("抓取完成，机械臂已回到 HOME，请选择下一个目标。")
+                    else:
+                        streamer.set_control_message(
+                            "抓取完成，机械臂已回到 HOME，请选择下一个目标。"
+                        )
+                continue
         return False
 
     def pose_confirmed(self, target, label):

@@ -602,17 +602,15 @@ def _detection_from_result(name, conf, bbox, mask, color_image, depth_frame, dep
     if not np.any(inner):
         return None
 
-    surface = robust_surface_point(depth_frame, inner, depth_scale, config)
-    if surface is None:
-        return None
-
     contours, _ = cv2.findContours(full_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     if not contours:
         return None
     contour = max(contours, key=cv2.contourArea)
     if cv2.contourArea(contour) < 50.0:
         return None
-    rect_points = cv2.boxPoints(cv2.minAreaRect(contour.astype(np.float32)))
+    minimum_rect = cv2.minAreaRect(contour.astype(np.float32))
+    grasp_center_pixel = np.asarray(minimum_rect[0], dtype=float)
+    rect_points = cv2.boxPoints(minimum_rect)
     edges = np.roll(rect_points, -1, axis=0) - rect_points
     edge_lengths = np.linalg.norm(edges, axis=1)
     short_edge_uv = edges[int(np.argmin(edge_lengths))]
@@ -620,6 +618,11 @@ def _detection_from_result(name, conf, bbox, mask, color_image, depth_frame, dep
     if short_edge_norm < 1e-6:
         return None
     short_axis_uv = short_edge_uv / short_edge_norm
+
+    surface = robust_surface_point(depth_frame, inner, depth_scale, config)
+    if surface is None:
+        return None
+    depth_pixel = np.asarray(surface["pixel"], dtype=float)
 
     return {
         "confidence": float(conf),
@@ -630,7 +633,16 @@ def _detection_from_result(name, conf, bbox, mask, color_image, depth_frame, dep
         "color_frames": 1,
         "color_samples": color_samples,
         "color_margin": color_margin,
-        "pixel": surface["pixel"],
+        # Use the segmentation OBB centre as the grasp ray.  The previous
+        # near-depth pixel was consistently on the camera-nearest end of a
+        # tilted brick, which made the otherwise-correct jaw pose grab its
+        # tail by roughly 2--3 cm.  Depth still comes from the robust coherent
+        # near surface, but it is projected along the object's centre ray.
+        "pixel": grasp_center_pixel,
+        "depth_pixel": depth_pixel,
+        "grasp_center_shift_px": float(
+            np.linalg.norm(grasp_center_pixel - depth_pixel)
+        ),
         "depth_m": surface["depth_m"],
         "depth_samples": surface["depth_samples"],
         "depth_spread_m": surface["depth_spread_m"],

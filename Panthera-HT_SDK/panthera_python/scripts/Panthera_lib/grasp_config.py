@@ -233,7 +233,11 @@ class GraspConfig:
     max_dynamic_approach_tilt_deg: float = 25.0
     gripper_open_axis_offset_deg: float = 0.0
 
-    direct_grasp_duration: float = 5.0
+    # 15..40 mm final approach: 5.0 s was visibly too slow.  3.5 s shortens
+    # the move by 30% while the dense executor still enforces configured joint
+    # velocity and acceleration limits before sending a command.
+    direct_grasp_duration: float = 3.5
+    grasp_retry_retreat_duration: float = 2.0
     direct_grasp_post_command_wait: float = 1.0
     direct_grasp_settle_timeout: float = 4.0
     direct_grasp_joint_tolerance_rad: float = 0.050
@@ -347,6 +351,8 @@ class GraspConfig:
             raise ValueError("manual_grasp_rotation must be right handed")
         if not 0.0 <= self.grasp_approach_overtravel_m <= 0.015:
             raise ValueError("grasp approach overtravel must be between 0 and 15 mm")
+        if self.direct_grasp_duration <= 0.0 or self.grasp_retry_retreat_duration <= 0.0:
+            raise ValueError("grasp approach and retry retreat durations must be positive")
         if not np.allclose(
             self.graspnet_gripper_fix_rotation.T @ self.graspnet_gripper_fix_rotation,
             np.eye(3),

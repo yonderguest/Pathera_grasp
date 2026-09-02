@@ -405,6 +405,15 @@ class VisionStreamer:
             self._control_message = f"当前目标：{label}积木；机械臂流程已接收。"
             self._condition.notify_all()
 
+    def clear_selected_target(self, message: str = "等待目标输入。") -> None:
+        """Clear the completed target before accepting the next grasp request."""
+        with self._condition:
+            self._selected_color = None
+            self._has_selected_color = False
+            self._pending_target_command = None
+            self._control_message = str(message)
+            self._condition.notify_all()
+
     def submit_target_command(self, command: str) -> None:
         """Queue one browser command; a newer submission replaces an old one."""
         normalized = str(command).strip()
