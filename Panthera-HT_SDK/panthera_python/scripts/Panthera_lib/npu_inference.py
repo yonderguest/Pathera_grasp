@@ -1,4 +1,4 @@
-"""Qualcomm QNN HTP NPU client for the block-only YOLOE segmentation model.
+"""Qualcomm QNN HTP NPU client for compiled YOLOE segmentation profiles.
 
 This module wraps the prebuilt ``npu_server`` binary.  The server loads the QNN
 context once and keeps running, while Python sends preprocessed 1x3x640x640
@@ -25,11 +25,11 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-from .grasp_config import GraspConfig
+from .grasp_config import GraspConfig, canonical_object_name
 
 
 class NpuYoloDetector:
-    """Persistent QNN HTP YOLOE detector for four generic block prompts."""
+    """Persistent QNN HTP YOLOE detector with profile-bound class names."""
 
     def __init__(self, config: GraspConfig, confidence: float = 0.30) -> None:
         project_root = Path(config.project_root)
@@ -183,10 +183,22 @@ class NpuYoloDetector:
         return self._decode(outs, height, width, ratio, dx, dy)
 
     @staticmethod
-    def _nms_indices(boxes, scores, iou_threshold, pre_top_k, max_detections):
-        """Class-agnostic NMS before expensive prototype-mask decoding."""
+    def _nms_indices(
+        boxes,
+        scores,
+        iou_threshold,
+        pre_top_k,
+        max_detections,
+        labels=None,
+    ):
+        """Class-aware NMS before expensive prototype-mask decoding."""
         boxes = np.asarray(boxes, dtype=np.float32)
         scores = np.asarray(scores, dtype=np.float32)
+        labels = (
+            np.zeros(len(boxes), dtype=int)
+            if labels is None
+            else np.asarray(labels, dtype=int)
+        )
         order = np.argsort(scores)[::-1][: int(pre_top_k)]
         kept: list[int] = []
         while order.size and len(kept) < int(max_detections):
@@ -208,7 +220,9 @@ class NpuYoloDetector:
                 0.0, boxes[rest, 3] - boxes[rest, 1]
             )
             union = np.maximum(area_current + area_rest - intersection, 1e-9)
-            order = rest[(intersection / union) <= float(iou_threshold)]
+            iou = intersection / union
+            same_class = labels[rest] == labels[current]
+            order = rest[(~same_class) | (iou <= float(iou_threshold))]
         return kept
 
     def _decode(
@@ -260,12 +274,19 @@ class NpuYoloDetector:
             & valid_box
             & (confidence >= self.confidence)
         )[0]
+        canonical_names = [
+            canonical_object_name(self.names[int(label)]) for label in labels[eligible]
+        ]
+        canonical_ids = {
+            name: index for index, name in enumerate(dict.fromkeys(canonical_names))
+        }
         selected = self._nms_indices(
             mapped_boxes[eligible],
             confidence[eligible],
             self.iou_threshold,
             self.pre_nms_top_k,
             self.max_detections,
+            [canonical_ids[name] for name in canonical_names],
         )
         self.last_decode_stats = {
             "raw": int(pred.shape[0]),

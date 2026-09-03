@@ -1,0 +1,32 @@
+{
+  "default_profile": "object3",
+  "profiles": {
+    "object3": {
+      "context": "third_party/qnn/yoloe-26s-seg_640_iq9075_qnn_object3.bin",
+      "sha256": "25dbff5010f0dee5f15c9c39cb0eeb03a384a7d66401281ced98ddf35d02add6",
+      "classes": ["bottle", "box", "toy building block"],
+      "confidence": 0.2,
+      "input": "1,3,640,640",
+      "outputs": "output_0:1,300,38;output_1:1,32,160,160",
+      "source": "/home/ubuntu/d405_test/qnn/aihub_out/yoloe-26s-seg_640_iq9075_qnn_object3.bin"
+    },
+    "block4": {
+      "context": "third_party/qnn/yoloe-26s-seg_640_iq9075_qnn_block4.bin",
+      "classes": [
+        "toy building block",
+        "plastic building block",
+        "wooden block",
+        "Lego brick"
+      ],
+      "confidence": 0.15,
+      "input": "1,3,640,640",
+      "outputs": "output_0:1,300,38;output_1:1,32,160,160"
+    }
+  },
+  "color": {
+    "default_backend": "lab",
+    "calibration": "config/color_calibration.json",
+    "samples": "config/color_calibration_samples.json",
+    "legacy_backend": "hsv"
+  }
+}

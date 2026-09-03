@@ -13,6 +13,7 @@ from Panthera_lib.vision_pipeline import (
     detect_requested_color_regions,
     robust_surface_point,
 )
+from Panthera_lib.vision_streamer import VisionStreamer
 
 
 def _capture(frame_seq: int, value: int) -> dict:
@@ -173,3 +174,68 @@ class PerceptionSnapshotTests(unittest.TestCase):
 
         feed._store_inference_result(_capture(4, 4), [])
         self.assertEqual(feed.wait_for_newer(marker, timeout=0.02)["frame_seq"], 4)
+
+    def test_raw_capture_api_does_not_wait_for_object_inference(self):
+        feed = CameraFeed(None, None, GraspConfig(), 0.001)
+        feed._latest_capture = _capture(11, 11)
+
+        self.assertEqual(feed.capture_freshness_marker(), 11)
+        capture = feed.latest_capture()
+        self.assertEqual(capture["frame_seq"], 11)
+        self.assertTrue(np.all(capture["color_image"] == 11))
+        self.assertIsNone(feed.wait_for_new_capture(11, timeout=0.01))
+
+        feed._latest_capture = _capture(12, 12)
+        self.assertEqual(feed.wait_for_new_capture(11, timeout=0.01)["frame_seq"], 12)
+
+    def test_hand_mode_pause_clears_stale_object_snapshot(self):
+        feed = CameraFeed(None, None, GraspConfig(), 0.001)
+        feed._store_inference_result(_capture(5, 5), [{"id": 5}])
+        self.assertIsNotNone(feed.latest())
+
+        feed.set_object_inference_enabled(False)
+
+        self.assertFalse(feed._object_inference_enabled)
+        self.assertIsNone(feed.latest())
+        self.assertEqual(feed.freshness_marker(), -1)
+        feed._store_inference_result(_capture(6, 6), [{"id": 6}])
+        self.assertIsNone(feed.latest())
+
+        feed.set_object_inference_enabled(True)
+        self.assertTrue(feed._object_inference_enabled)
+        self.assertIsNone(feed.latest())
+
+    def test_paused_object_result_cannot_overwrite_hand_preview(self):
+        class Streamer:
+            def __init__(self):
+                self.calls = []
+
+            def publish(self, *args, **kwargs):
+                self.calls.append((args, kwargs))
+
+        streamer = Streamer()
+        feed = CameraFeed(
+            None,
+            None,
+            GraspConfig(),
+            0.001,
+            streamer=streamer,
+        )
+        snapshot = feed._store_inference_result(_capture(7, 7), [], 0.01)
+        self.assertIsNotNone(snapshot)
+
+        feed.set_object_inference_enabled(False)
+
+        self.assertFalse(feed._publish_object_snapshot_if_current(snapshot))
+        self.assertEqual(streamer.calls, [])
+
+    def test_streamer_keeps_raw_and_analysis_generations_separate(self):
+        streamer = VisionStreamer(preview_fps=1000.0)
+        raw = np.full((2, 2, 3), 8, dtype=np.uint8)
+        analysis = np.full((2, 2, 3), 9, dtype=np.uint8)
+        streamer.publish_capture(raw, np.ones((2, 2), dtype=np.uint16), 0.001)
+        raw_snapshot = streamer._wait_for_next_frame(-1, kind="raw")
+        self.assertEqual(raw_snapshot[0][0, 0, 0], 8)
+        streamer.publish(analysis, [{"bbox": (0, 0, 1, 1)}])
+        yolo_snapshot = streamer._wait_for_next_frame(-1, kind="yolo")
+        self.assertEqual(yolo_snapshot[0][0, 0, 0], 9)

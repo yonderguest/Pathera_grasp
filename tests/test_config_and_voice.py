@@ -1,10 +1,18 @@
 from __future__ import annotations
 
+from dataclasses import replace
 import threading
 import unittest
 from unittest.mock import patch
 
-from Panthera_lib.grasp_config import GraspConfig, parse_target_command
+from Panthera_lib.grasp_config import (
+    GraspConfig,
+    ObjectGraspProfile,
+    TargetRequest,
+    canonical_object_name,
+    parse_target_command,
+    parse_target_request,
+)
 from grasp_demo import choose_target_at_start
 from voice_controller import VoiceInterface
 
@@ -36,7 +44,10 @@ class ConfigAndVoiceTests(unittest.TestCase):
 
         streamer = Streamer()
         with patch("grasp_demo.sys.stdin", HeadlessInput()):
-            self.assertEqual(choose_target_at_start(None, streamer), "green")
+            self.assertEqual(
+                choose_target_at_start(None, streamer),
+                TargetRequest("toy building block", "green"),
+            )
         self.assertTrue(any("green" in message for message in streamer.messages))
         self.assertFalse(streamer.accepting)
 
@@ -87,15 +98,30 @@ class ConfigAndVoiceTests(unittest.TestCase):
         self.assertEqual(config.joint1_jog_step_rad, 0.5)
         self.assertEqual(config.central_x_grasp_ratio, 0.80)
         self.assertEqual(config.stream_jpeg_quality, 92)
+        self.assertEqual(config.follow_max_tcp_step_m, 0.020)
         self.assertEqual(config.color_yellow_green_boundary, 38)
         self.assertTrue(config.use_npu)
-        self.assertEqual(config.npu_confidence_threshold, 0.15)
-        self.assertTrue(config.npu_context_path.endswith("_block4.bin"))
+        self.assertEqual(config.recognition_profile, "object3")
+        self.assertEqual(config.npu_confidence_threshold, 0.20)
+        self.assertTrue(config.npu_context_path.endswith("_object3.bin"))
+        self.assertEqual(
+            config.npu_class_names,
+            ("bottle", "box", "toy building block"),
+        )
         self.assertEqual(config.npu_class_names, config.target_prompts)
         self.assertEqual(
             (config.scan_j1_start, config.scan_j1_end, config.scan_j1_step),
             (1.8, -1.8, 0.3),
         )
+        config.validate()
+
+        with self.assertRaisesRegex(ValueError, "follow_max_tcp_step_m"):
+            GraspConfig(follow_max_tcp_step_m=0.021).validate()
+
+        config.apply_recognition_profile("block4")
+        self.assertEqual(config.recognition_profile, "block4")
+        self.assertEqual(config.npu_confidence_threshold, 0.15)
+        self.assertTrue(config.npu_context_path.endswith("_block4.bin"))
         config.validate()
 
     def test_colour_parser_understands_negation(self):
@@ -110,6 +136,134 @@ class ConfigAndVoiceTests(unittest.TestCase):
         for command, expected in cases:
             with self.subTest(command=command):
                 self.assertEqual(parse_target_command(command), expected)
+
+    def test_object_profiles_preserve_blocks_and_fail_closed_for_unconfirmed_shapes(self):
+        config = GraspConfig()
+        block = config.object_grasp_profile("toy_building_block")
+        self.assertIsInstance(block, ObjectGraspProfile)
+        self.assertTrue(block.motion_ready)
+        self.assertTrue(block.preserve_legacy_pipeline)
+        self.assertEqual(block.min_confidence, config.npu_confidence_threshold)
+        self.assertEqual(block.required_coherent_frames, 1)
+        self.assertEqual(block.gripper_open_position_rad, config.gripper_open_position)
+        self.assertEqual(
+            block.gripper_close_torque_limit,
+            config.gripper_close_torque,
+        )
+        self.assertEqual(block.load_min_torque, config.grasp_min_force)
+        self.assertEqual(block.approach_inset_m, config.grasp_approach_overtravel_m)
+        self.assertEqual(block.center_strategy, "segmentation_obb_center")
+        self.assertEqual(block.orientation_strategy, "mask_obb_short_axis")
+        self.assertEqual(block.depth_strategy, "coherent_near_surface")
+
+        for object_name in ("bottle", "box"):
+            profile = config.object_grasp_profile(object_name)
+            self.assertFalse(profile.motion_enabled)
+            self.assertTrue(profile.plan_only)
+            self.assertFalse(profile.parameters_confirmed)
+            self.assertFalse(profile.motion_ready)
+            self.assertEqual(profile.min_confidence, 0.35)
+            self.assertEqual(profile.required_coherent_frames, 3)
+            self.assertIn("gripper_opening_m", profile.missing_motion_parameters)
+
+        config.graspable_object_names = ("toy building block", "bottle")
+        with self.assertRaisesRegex(ValueError, "bottle.*not motion-ready"):
+            config.validate()
+
+    def test_confirmed_object_profile_can_be_enabled_without_changing_block_profile(self):
+        config = GraspConfig()
+        original_block = config.object_grasp_profile("toy building block")
+        config.object_grasp_profiles["bottle"] = replace(
+            config.object_grasp_profile("bottle"),
+            motion_enabled=True,
+            plan_only=False,
+            parameters_confirmed=True,
+            gripper_open_position_rad=1.50,
+            gripper_opening_m=0.080,
+            gripper_close_torque_limit=0.70,
+            load_min_torque=0.40,
+            max_payload_kg=0.30,
+            approach_inset_m=0.010,
+            center_strategy="segmentation_obb_center",
+            orientation_strategy="mask_obb_short_axis",
+            depth_strategy="coherent_near_surface",
+            max_dimensions_m=(0.080, 0.080, 0.250),
+        )
+        config.graspable_object_names = ("toy building block", "bottle")
+        config.validate()
+        self.assertTrue(config.object_grasp_profile("bottle").motion_ready)
+        self.assertEqual(
+            config.object_grasp_profile("toy building block"),
+            original_block,
+        )
+
+    def test_bottle_cannot_bypass_missing_parameters_with_legacy_flag(self):
+        config = GraspConfig()
+        config.object_grasp_profiles["bottle"] = replace(
+            config.object_grasp_profile("bottle"),
+            motion_enabled=True,
+            plan_only=False,
+            parameters_confirmed=True,
+            preserve_legacy_pipeline=True,
+        )
+        with self.assertRaisesRegex(ValueError, "preserve_legacy_pipeline"):
+            config.validate()
+
+    def test_graspable_objects_must_exist_in_selected_recognition_profile(self):
+        config = GraspConfig()
+        config.apply_recognition_profile("block4")
+        configured_bottle = replace(
+            config.object_grasp_profile("bottle"),
+            motion_enabled=True,
+            plan_only=False,
+            parameters_confirmed=True,
+            gripper_open_position_rad=1.50,
+            gripper_opening_m=0.080,
+            gripper_close_torque_limit=0.70,
+            load_min_torque=0.40,
+            max_payload_kg=0.30,
+            approach_inset_m=0.010,
+            center_strategy="segmentation_obb_center",
+            orientation_strategy="mask_obb_short_axis",
+            depth_strategy="coherent_near_surface",
+            max_dimensions_m=(0.080, 0.080, 0.250),
+        )
+        config.object_grasp_profiles["bottle"] = configured_bottle
+        config.graspable_object_names = ("toy building block", "bottle")
+        with self.assertRaisesRegex(ValueError, "selected recognition profile"):
+            config.validate()
+
+    def test_object_and_colour_parser_keeps_class_constraint(self):
+        cases = [
+            ("瓶子", TargetRequest("bottle", None)),
+            ("盒子", TargetRequest("box", None)),
+            ("红色瓶子", TargetRequest("bottle", "red")),
+            ("蓝色盒子", TargetRequest("box", "blue")),
+            ("绿色积木", TargetRequest("toy building block", "green")),
+            ("yellow", TargetRequest("toy building block", "yellow")),
+            ("任意物体", TargetRequest(None, None)),
+        ]
+        for command, expected in cases:
+            with self.subTest(command=command):
+                self.assertEqual(parse_target_request(command), (expected, True))
+
+    def test_target_parser_rejects_negated_only_and_multi_target_ambiguity(self):
+        rejected = (
+            "不要红色瓶子",
+            "红色瓶子和蓝色盒子",
+            "红色或者蓝色积木",
+            "瓶子或者盒子",
+            "任意颜色红色积木",
+        )
+        for command in rejected:
+            with self.subTest(command=command):
+                self.assertEqual(parse_target_request(command), (None, False))
+
+        self.assertEqual(
+            parse_target_request("不要红色，要蓝色瓶子"),
+            (TargetRequest("bottle", "blue"), True),
+        )
+        self.assertEqual(canonical_object_name("toy_building_block"), "toy building block")
 
     def test_voice_listen_waits_for_tts_to_drain(self):
         events = []

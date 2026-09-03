@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import itertools
 import signal
 import threading
 import time
@@ -10,7 +11,11 @@ from enum import Enum
 
 import numpy as np
 
-from .grasp_config import GraspConfig
+from .grasp_config import (
+    GraspConfig,
+    canonical_object_name,
+    normalize_target_request,
+)
 from .vision_pipeline import (
     apply_accumulated_color,
     detect_requested_color_regions,
@@ -352,15 +357,51 @@ class GraspPlanner:
         }
         if position_tolerance is not None:
             move_kwargs["tolerance"] = float(position_tolerance)
-        with self.sdk_call():
-            result = self.robot.move_j_checked(joints, **move_kwargs)
-        if result is False:
-            raise RuntimeError(f"{label} move failed")
+        dense_executor = getattr(
+            self.robot,
+            "execute_joint_trajectory_checked",
+            None,
+        )
+        used_dense_executor = wait and callable(dense_executor)
+        if used_dense_executor:
+            # The deployed motor firmware requires control refreshes while a
+            # move is in flight.  Reuse the validated 50 Hz MIT executor rather
+            # than issuing one Joint_Pos_Vel command and then only polling.
+            start = self.current_joint_position()
+            trajectory = np.vstack((start, joints))
+            with self.sdk_call():
+                result = dense_executor(
+                    trajectory,
+                    duration=float(duration),
+                    max_torque=self.config.max_torque,
+                    label=label,
+                    control_period=self.config.trajectory_control_period_s,
+                )
+            if result is False:
+                raise RuntimeError(f"{label} dense move failed")
+            self._control_mode = "mit"
+            self._confirm_dense_joint_target(
+                joints,
+                label,
+                tolerance=(
+                    0.05
+                    if position_tolerance is None
+                    else float(position_tolerance)
+                ),
+            )
+        else:
+            with self.sdk_call():
+                result = self.robot.move_j_checked(joints, **move_kwargs)
+            if result is False:
+                raise RuntimeError(f"{label} move failed")
         print(
             f"[MOVE] {label}: completed in {time.monotonic() - started:.2f}s.",
             flush=True,
         )
-        self._control_mode = "joint_pos_vel"
+        # Keep the controller mode aligned with the command that is actually
+        # active. Resetting this unconditionally made the next camera wait
+        # switch from gravity-compensated MIT to Joint_Pos_Vel.
+        self._control_mode = "mit" if used_dense_executor else "joint_pos_vel"
         self._remember_command(joints)
         if self.lifecycle_state not in {
             RobotLifecycleState.STOPPING,
@@ -369,18 +410,68 @@ class GraspPlanner:
         }:
             self.lifecycle_state = RobotLifecycleState.ACTIVE
 
+    def _confirm_dense_joint_target(self, target, label, tolerance):
+        """Keep the final MIT command alive while checking fresh feedback."""
+        cfg = self.config
+        target = np.asarray(target, dtype=float)
+        deadline = time.monotonic() + cfg.joint_move_settle_timeout_s
+        stable = 0
+        last_position = None
+        last_velocity = None
+        hold_once = getattr(self.robot, "hold_joints_mit_once", None)
+        while time.monotonic() < deadline:
+            with self.sdk_call():
+                refresh = getattr(self.robot, "refresh_motor_state", None)
+                if callable(refresh):
+                    refresh()
+                actual = np.asarray(self.robot.current_joint_position(), dtype=float)
+                velocity = np.asarray(self.robot.get_current_vel(), dtype=float)
+            if (
+                actual.shape != (6,)
+                or velocity.shape != (6,)
+                or not np.all(np.isfinite(actual))
+                or not np.all(np.isfinite(velocity))
+            ):
+                raise RuntimeError(f"{label} returned invalid joint feedback")
+            error = float(np.max(np.abs(actual - target)))
+            speed = float(np.max(np.abs(velocity)))
+            last_position = actual
+            last_velocity = velocity
+            if error > cfg.joint_move_max_endpoint_error_rad:
+                if callable(hold_once):
+                    with self.sdk_call():
+                        hold_once(actual, cfg.max_torque)
+                raise RuntimeError(
+                    f"{label} tracking error is unsafe: max_error={error:.3f} rad, "
+                    f"actual={np.round(actual, 4)}, target={np.round(target, 4)}"
+                )
+            if (
+                error <= float(tolerance)
+                and speed <= cfg.detection_stationary_velocity_tolerance
+            ):
+                stable += 1
+                if stable >= cfg.detection_stationary_stable_samples:
+                    return
+            else:
+                stable = 0
+            if callable(hold_once):
+                with self.sdk_call():
+                    result = hold_once(target, cfg.max_torque)
+                if result is False:
+                    raise RuntimeError(f"{label} final MIT hold was rejected")
+            time.sleep(cfg.trajectory_control_period_s)
+        raise RuntimeError(
+            f"{label} did not settle: actual={np.round(last_position, 4)}, "
+            f"target={np.round(target, 4)}, velocity={np.round(last_velocity, 4)}"
+        )
+
     def home(self):
-        with self.sdk_call():
-            result = self.robot.Joint_Pos_Vel(
-                self.config.home.tolist(),
-                self.config.home_velocity,
-                self.config.max_torque,
-                iswait=True,
-            )
-        if result is False:
-            raise RuntimeError("HOME move failed")
-        self._control_mode = "joint_pos_vel"
-        self._remember_command(self.config.home)
+        self.move_j(
+            self.config.home,
+            self.config.return_home_duration,
+            "HOME",
+            position_tolerance=self.config.zero_position_tolerance,
+        )
         self.lifecycle_state = RobotLifecycleState.HOMED
         self._say("机械臂已回到初始位置")
 
@@ -1444,6 +1535,7 @@ class GraspPlanner:
         joint1,
         label,
         requested_color=None,
+        requested_object=None,
         target_base_override=None,
     ):
         """Choose the highest-scoring GraspNet candidate that is reachable."""
@@ -1517,6 +1609,10 @@ class GraspPlanner:
                     "base_point": target_base_point,
                     "detected_color": detection.get("color"),
                     "requested_color": requested_color,
+                    "detected_object": canonical_object_name(
+                        detection.get("class_name")
+                    ),
+                    "requested_object": requested_object,
                     "detection": detection,
                     "provisional_joints": provisional,
                     "scan_joint1": joint1,
@@ -1529,10 +1625,24 @@ class GraspPlanner:
         return None
 
     @staticmethod
-    def _color_matches_request(color, requested_color):
+    def _color_matches_request(
+        color,
+        requested_color,
+        *,
+        allow_unknown_color=False,
+    ):
         if requested_color is None:
-            return color != "unknown"
+            # Preserve the legacy any-colour block gate: an unclassified block
+            # is not silently accepted.  Generic object-only preview requests
+            # may opt in because transparent bottles and uncalibrated boxes can
+            # be valid object detections while Lab correctly reports unknown.
+            return bool(allow_unknown_color) or color != "unknown"
         return color == requested_color
+
+    @staticmethod
+    def _object_matches_request(class_name, requested_object):
+        canonical = canonical_object_name(class_name)
+        return requested_object is None or canonical == requested_object
 
     def _accumulate_candidate_color(
         self,
@@ -1543,9 +1653,11 @@ class GraspPlanner:
         requested_color,
         after_sequence,
         deadline=None,
+        allow_unknown_color=False,
     ):
         """Merge weak color evidence only while the arm is stationary."""
         cfg = self.config
+        tracked_object = canonical_object_name(detection.get("class_name"))
         evidence_items = [detection["color_evidence"]]
         tracked = apply_accumulated_color(detection, evidence_items, 1, cfg)
         if (
@@ -1580,6 +1692,8 @@ class GraspPlanner:
             nearest_point = None
             nearest_distance = float("inf")
             for candidate in capture["detections"]:
+                if canonical_object_name(candidate.get("class_name")) != tracked_object:
+                    continue
                 try:
                     _, candidate_point = object_base_position(
                         candidate,
@@ -1616,6 +1730,7 @@ class GraspPlanner:
                 and self._color_matches_request(
                     accumulated["color"],
                     requested_color,
+                    allow_unknown_color=allow_unknown_color,
                 )
             ):
                 return accumulated, marker
@@ -1638,7 +1753,15 @@ class GraspPlanner:
         reference_base_point=None,
     ):
         cfg = self.config
-        color_label = selected_color if selected_color is not None else "any colour"
+        target_request = normalize_target_request(selected_color)
+        selected_color = target_request.color
+        selected_object = canonical_object_name(target_request.object_name)
+        allow_unknown_color = (
+            selected_color is None
+            and selected_object is not None
+            and selected_object != "toy building block"
+        )
+        color_label = target_request.label
         stable_joint_position = self.wait_until_stationary()
         if stable_joint_position is None:
             return None
@@ -1690,10 +1813,20 @@ class GraspPlanner:
             )
         capture["robot_joint_position"] = scan_joint_position.copy()
         capture["base_camera"] = np.asarray(base_camera, dtype=float).copy()
-        raw_detections = list(capture["detections"])
+        raw_detections = [
+            item
+            for item in capture["detections"]
+            if self._object_matches_request(item.get("class_name"), selected_object)
+        ]
         if selected_color is None:
-            known = [item for item in raw_detections if item.get("color") != "unknown"]
-            relevant_detections = known if known else raw_detections
+            if allow_unknown_color:
+                relevant_detections = raw_detections
+            else:
+                known = [
+                    item for item in raw_detections
+                    if item.get("color") != "unknown"
+                ]
+                relevant_detections = known if known else raw_detections
         else:
             exact = [
                 item for item in raw_detections
@@ -1730,6 +1863,7 @@ class GraspPlanner:
                 selected_color,
                 color_marker,
                 deadline=color_deadline,
+                allow_unknown_color=allow_unknown_color,
             )
             print(
                 f"[COLOR] J1={joint1:+.2f} candidate {candidate_index}: "
@@ -1740,12 +1874,17 @@ class GraspPlanner:
                 f"margin={accumulated['color_margin']:.1%}."
             )
             detections.append(accumulated)
-        if selected_color is None:
-            matches = [d for d in detections if d.get("color") != "unknown"]
-        else:
-            matches = [d for d in detections if d.get("color") == selected_color]
+        matches = [
+            detection
+            for detection in detections
+            if self._color_matches_request(
+                detection.get("color"),
+                selected_color,
+                allow_unknown_color=allow_unknown_color,
+            )
+        ]
         if not matches:
-            print(f"[{label}] J1={joint1:+.2f}: no {color_label} block.")
+            print(f"[{label}] J1={joint1:+.2f}: no {color_label} target.")
             return None
 
         central_matches = [
@@ -1756,7 +1895,7 @@ class GraspPlanner:
             for detection in matches:
                 x1, _y1, x2, _y2 = detection["bbox"]
                 print(
-                    f"[{label}] J1={joint1:+.2f}: {color_label} block at "
+                    f"[{label}] J1={joint1:+.2f}: {color_label} target at "
                     f"x_center={0.5 * (x1 + x2):.1f} is outside central "
                     f"{self.config.central_x_grasp_ratio:.0%} region."
                 )
@@ -1802,6 +1941,7 @@ class GraspPlanner:
                 joint1,
                 label,
                 requested_color=selected_color,
+                requested_object=selected_object,
             )
 
         for detection in matches:
@@ -1879,6 +2019,8 @@ class GraspPlanner:
                 "base_point": base_point,
                 "detected_color": detection["color"],
                 "requested_color": selected_color,
+                "detected_object": canonical_object_name(detection["class_name"]),
+                "requested_object": selected_object,
                 "detection": detection,
                 "provisional_joints": provisional,
                 "scan_joint1": joint1,
@@ -1899,6 +2041,29 @@ class GraspPlanner:
             cosine = abs(cosine)
         return float(np.degrees(np.arccos(np.clip(cosine, -1.0, 1.0))))
 
+    @staticmethod
+    def _tightest_observation_subset(observations, required_count):
+        """Return the most spatially coherent fixed-size observation subset."""
+        required_count = int(required_count)
+        if required_count < 1 or len(observations) < required_count:
+            return list(observations), float("inf")
+        best_subset = None
+        best_key = None
+        for indices in itertools.combinations(range(len(observations)), required_count):
+            subset = [observations[index] for index in indices]
+            points = np.asarray(
+                [item["base_point"] for item in subset],
+                dtype=float,
+            )
+            centre = np.median(points, axis=0)
+            spread = float(np.max(np.linalg.norm(points - centre, axis=1)))
+            # Prefer lower spread; for an exact tie prefer the newest set.
+            key = (spread, -sum(indices))
+            if best_key is None or key < best_key:
+                best_key = key
+                best_subset = subset
+        return best_subset, float(best_key[0])
+
     def refine_target_at_observation_pose(
         self,
         camera_feed,
@@ -1910,6 +2075,13 @@ class GraspPlanner:
     ):
         """Track one physical block over several coherent post-move snapshots."""
         cfg = self.config
+        target_request = normalize_target_request(selected_color)
+        selected_color = target_request.color
+        tracked_object = canonical_object_name(
+            found.get("detected_object")
+            or found.get("detection", {}).get("class_name")
+            or target_request.object_name
+        )
         stage = "CLOSE-REFINE" if position_only else "REFINE"
         stable_joints = self.wait_until_stationary()
         if stable_joints is None:
@@ -1957,6 +2129,11 @@ class GraspPlanner:
         expected_base = np.asarray(found["base_point"], dtype=float)
         tracked_color = selected_color or found.get("detected_color")
         observations = []
+        spread_limit = (
+            cfg.close_refine_max_position_spread_m
+            if position_only
+            else cfg.refine_max_position_spread_m
+        )
         last_intrinsic = intrinsic
         quality_rejections = []
         for attempt in range(1, cfg.refine_max_frame_attempts + 1):
@@ -1978,10 +2155,14 @@ class GraspPlanner:
             capture_intrinsic = capture.get("intrinsics")
             if capture_intrinsic is not None:
                 last_intrinsic = capture_intrinsic
-            detections = list(capture.get("detections", []))
+            detections = [
+                item
+                for item in capture.get("detections", [])
+                if self._object_matches_request(item.get("class_name"), tracked_object)
+            ]
             if tracked_color is not None and not any(
                 item.get("color") == tracked_color for item in detections
-            ):
+            ) and tracked_object == "toy building block":
                 fallback = detect_requested_color_regions(
                     capture["color_image"],
                     capture["depth_image"],
@@ -2092,7 +2273,19 @@ class GraspPlanner:
                 f"spread={float(nearest.get('depth_spread_m', float('nan'))) * 1000.0:.1f} mm"
             )
             if len(observations) >= cfg.refine_required_observations:
-                break
+                coherent, coherent_spread = self._tightest_observation_subset(
+                    observations,
+                    cfg.refine_required_observations,
+                )
+                if coherent_spread <= spread_limit:
+                    observations = coherent
+                    break
+                print(
+                    f"[{stage}] first {len(observations)} valid observation(s) "
+                    f"are not yet coherent: best spread={coherent_spread:.3f} m "
+                    f"> limit={spread_limit:.3f} m; continuing within the "
+                    "existing frame budget."
+                )
 
         if len(observations) < cfg.refine_required_observations:
             print(
@@ -2101,6 +2294,10 @@ class GraspPlanner:
                 "recognition pose."
             )
             return None
+        observations, _ = self._tightest_observation_subset(
+            observations,
+            cfg.refine_required_observations,
+        )
         points = np.asarray([item["base_point"] for item in observations], dtype=float)
         refined_base = np.median(points, axis=0)
         spread = float(np.max(np.linalg.norm(points - refined_base, axis=1)))
@@ -2111,11 +2308,6 @@ class GraspPlanner:
         correction_xy = float(np.linalg.norm(correction[:2]))
         correction_z = abs(float(correction[2]))
         correction_total = float(np.linalg.norm(correction))
-        spread_limit = (
-            cfg.close_refine_max_position_spread_m
-            if position_only
-            else cfg.refine_max_position_spread_m
-        )
         xy_limit = (
             cfg.close_refine_max_xy_correction_m
             if position_only
@@ -2206,6 +2398,7 @@ class GraspPlanner:
                 float(current_joints[0]),
                 "REFINE",
                 requested_color=selected_color,
+                requested_object=tracked_object,
                 target_base_override=refined_base,
             )
             if refreshed is not None:
@@ -2275,6 +2468,9 @@ class GraspPlanner:
                 "provisional_joints": provisional,
                 "detection": representative["detection"],
                 "detected_color": representative["detection"]["color"],
+                "detected_object": canonical_object_name(
+                    representative["detection"]["class_name"]
+                ),
             }
         )
         return refreshed
@@ -2287,9 +2483,10 @@ class GraspPlanner:
         selected_color,
     ):
         cfg = self.config
-        color_label = selected_color if selected_color is not None else "any colour"
+        target_request = normalize_target_request(selected_color)
+        color_label = target_request.label
         print(
-            f"[SCAN] searching for {color_label} block: "
+            f"[SCAN] searching for {color_label}: "
             f"J1 {cfg.scan_j1_start:+.2f} -> {cfg.scan_j1_end:+.2f} rad, "
             f"step {cfg.scan_j1_step:.2f} rad."
         )
@@ -2306,7 +2503,7 @@ class GraspPlanner:
             camera_feed,
             intrinsic,
             tcp_camera,
-            selected_color,
+            target_request,
             current_joint1,
             "FAST",
         )
@@ -2337,7 +2534,7 @@ class GraspPlanner:
                 camera_feed,
                 intrinsic,
                 tcp_camera,
-                selected_color,
+                target_request,
                 joint1,
                 "SCAN",
             )
@@ -2499,8 +2696,38 @@ class GraspPlanner:
             selected_color = select_target()
             if selected_color is False:
                 return False
+            target_request = normalize_target_request(selected_color)
+            requested_object = canonical_object_name(target_request.object_name)
+            if (
+                requested_object is None
+                or requested_object not in cfg.graspable_object_names
+            ):
+                print(
+                    "[SAFETY] object is recognised but not enabled for motion: "
+                    f"{target_request.label}. Allowed={cfg.graspable_object_names}",
+                    flush=True,
+                )
+                if streamer is not None:
+                    message = (
+                        "该物体目前只识别展示，尚未通过夹爪尺寸与载荷验证；"
+                        "机械臂不会运动，请选择积木。"
+                    )
+                    clear_target = getattr(streamer, "clear_selected_target", None)
+                    if callable(clear_target):
+                        # A browser submission has already entered GRASPING.
+                        # Return its mutually-exclusive control state to IDLE,
+                        # otherwise the next safe target would remain blocked.
+                        clear_target(message)
+                    else:
+                        streamer.set_control_message(message)
+                continue
+            selected_color = target_request
             if streamer is not None:
-                streamer.set_selected_color(selected_color)
+                set_target = getattr(streamer, "set_selected_target", None)
+                if callable(set_target):
+                    set_target(target_request)
+                else:
+                    streamer.set_selected_color(target_request.color)
 
             found = self.scan_for_target(
                 camera_feed,
@@ -2917,16 +3144,33 @@ class GraspPlanner:
                 or np.any(target > cfg.joint_upper)
             ):
                 raise RuntimeError(f"invalid {label} shutdown target: {target!r}")
-            with self.sdk_call():
-                result = self.robot.moveJ(
-                    target.tolist(),
-                    duration=duration,
-                    max_tqu=cfg.max_torque,
-                    iswait=True,
-                    timeout=timeout,
+            dense_executor = getattr(
+                self.robot,
+                "execute_joint_trajectory_checked",
+                None,
+            )
+            if callable(dense_executor):
+                # Shutdown must not fall back to the same one-shot transport
+                # that can time out during HOME.  The lifecycle guard inside
+                # move_j keeps this state STOPPING while the refreshed path is
+                # executed and checked.
+                self.move_j(
+                    target,
+                    duration,
+                    f"SHUTDOWN {label}",
+                    position_tolerance=cfg.zero_position_tolerance,
                 )
-            if result is False:
-                raise RuntimeError(f"{label} move rejected or timed out")
+            else:
+                with self.sdk_call():
+                    result = self.robot.moveJ(
+                        target.tolist(),
+                        duration=duration,
+                        max_tqu=cfg.max_torque,
+                        iswait=True,
+                        timeout=timeout,
+                    )
+                if result is False:
+                    raise RuntimeError(f"{label} move rejected or timed out")
             self._remember_command(target)
             time.sleep(cfg.zero_settle_time)
             if not self.pose_confirmed(target, label):

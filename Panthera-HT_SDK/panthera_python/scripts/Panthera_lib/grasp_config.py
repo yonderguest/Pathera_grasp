@@ -8,6 +8,146 @@ from pathlib import Path
 import numpy as np
 
 
+OBJECT3_CLASSES = ("bottle", "box", "toy building block")
+LEGACY_BLOCK4_CLASSES = (
+    "toy building block",
+    "plastic building block",
+    "wooden block",
+    "Lego brick",
+)
+CANONICAL_BLOCK_NAMES = frozenset(name.lower() for name in LEGACY_BLOCK4_CLASSES)
+
+
+@dataclass(frozen=True)
+class TargetRequest:
+    """Canonical operator request carried through detection and refinement."""
+
+    object_name: str | None = "toy building block"
+    color: str | None = None
+
+    @property
+    def label(self) -> str:
+        object_label = self.object_name or "any object"
+        color_label = self.color or "any colour"
+        return f"{color_label} {object_label}"
+
+
+@dataclass(frozen=True)
+class ObjectGraspProfile:
+    """Object-specific manipulation contract.
+
+    Recognition support and permission to move are intentionally separate.
+    ``bottle`` and ``box`` remain plan-only until their physical dimensions,
+    gripper aperture and load limits have been measured on the real hardware.
+    ``None`` therefore means "not calibrated", never "unlimited".
+    """
+
+    object_name: str
+    motion_enabled: bool = False
+    plan_only: bool = True
+    parameters_confirmed: bool = False
+    preserve_legacy_pipeline: bool = False
+    min_confidence: float = 0.35
+    required_coherent_frames: int = 3
+    gripper_open_position_rad: float | None = None
+    gripper_opening_m: float | None = None
+    gripper_close_torque_limit: float | None = None
+    load_min_torque: float | None = None
+    max_payload_kg: float | None = None
+    approach_inset_m: float | None = None
+    center_strategy: str = "unconfirmed"
+    orientation_strategy: str = "unconfirmed"
+    depth_strategy: str = "unconfirmed"
+    max_dimensions_m: tuple[float, float, float] | None = None
+
+    @property
+    def missing_motion_parameters(self) -> tuple[str, ...]:
+        """Return unconfirmed fields that block a new object motion profile."""
+        if self.preserve_legacy_pipeline:
+            return ()
+        required = {
+            "gripper_open_position_rad": self.gripper_open_position_rad,
+            "gripper_opening_m": self.gripper_opening_m,
+            "gripper_close_torque_limit": self.gripper_close_torque_limit,
+            "load_min_torque": self.load_min_torque,
+            "max_payload_kg": self.max_payload_kg,
+            "approach_inset_m": self.approach_inset_m,
+            "max_dimensions_m": self.max_dimensions_m,
+        }
+        missing = [name for name, value in required.items() if value is None]
+        for name, value in (
+            ("center_strategy", self.center_strategy),
+            ("orientation_strategy", self.orientation_strategy),
+            ("depth_strategy", self.depth_strategy),
+        ):
+            if not value or value == "unconfirmed":
+                missing.append(name)
+        return tuple(missing)
+
+    @property
+    def motion_ready(self) -> bool:
+        return (
+            self.motion_enabled
+            and not self.plan_only
+            and self.parameters_confirmed
+            and not self.missing_motion_parameters
+        )
+
+    def validate(self) -> None:
+        canonical = canonical_object_name(self.object_name)
+        if canonical not in OBJECT3_CLASSES:
+            raise ValueError(f"unsupported object grasp profile: {self.object_name!r}")
+        if self.preserve_legacy_pipeline and canonical != "toy building block":
+            raise ValueError(
+                "preserve_legacy_pipeline is only valid for toy building block"
+            )
+        if self.motion_enabled and self.plan_only:
+            raise ValueError(f"{canonical} cannot be both motion-enabled and plan-only")
+        if self.motion_enabled and not self.motion_ready:
+            missing = ", ".join(self.missing_motion_parameters) or "confirmation"
+            raise ValueError(f"{canonical} profile is not motion-ready: {missing}")
+        if not 0.0 < self.min_confidence <= 1.0:
+            raise ValueError(f"{canonical} has invalid min_confidence")
+        if self.required_coherent_frames < 1:
+            raise ValueError(f"{canonical} has invalid required_coherent_frames")
+        for name, value in (
+            ("gripper_open_position_rad", self.gripper_open_position_rad),
+            ("gripper_opening_m", self.gripper_opening_m),
+            ("gripper_close_torque_limit", self.gripper_close_torque_limit),
+            ("load_min_torque", self.load_min_torque),
+            ("max_payload_kg", self.max_payload_kg),
+            ("approach_inset_m", self.approach_inset_m),
+        ):
+            if value is not None and (not np.isfinite(value) or value < 0.0):
+                raise ValueError(f"{canonical} has invalid {name}: {value!r}")
+        if self.max_dimensions_m is not None:
+            dimensions = np.asarray(self.max_dimensions_m, dtype=float)
+            if (
+                dimensions.shape != (3,)
+                or not np.all(np.isfinite(dimensions))
+                or np.any(dimensions <= 0.0)
+            ):
+                raise ValueError(f"{canonical} has invalid max_dimensions_m")
+
+
+def canonical_object_name(name: str | None) -> str | None:
+    if name is None:
+        return None
+    normalized = str(name).strip().lower().replace("_", " ").replace("-", " ")
+    if normalized in CANONICAL_BLOCK_NAMES or normalized == "colour-region fallback":
+        return "toy building block"
+    return normalized
+
+
+def normalize_target_request(value) -> TargetRequest:
+    """Accept the new request object and legacy colour-string call sites."""
+    if isinstance(value, TargetRequest):
+        return value
+    if value is None or isinstance(value, str):
+        return TargetRequest(color=value)
+    raise TypeError(f"unsupported target request: {type(value).__name__}")
+
+
 @dataclass
 class GraspConfig:
     """Application-specific constants for the visual grasping workflow."""
@@ -21,6 +161,7 @@ class GraspConfig:
     stream_host: str = "0.0.0.0"
     stream_port: int = 8080
     stream_jpeg_quality: int = 92
+    stream_preview_fps: float = 15.0
     use_voice: bool = False
     voice_asr_model_dir: str = ""
     voice_tts_model_dir: str = ""
@@ -32,6 +173,11 @@ class GraspConfig:
     detection_stationary_joint_tolerance: float = 0.010
     detection_stationary_stable_samples: int = 3
     detection_stationary_timeout: float = 3.0
+    # Maximum accepted hand-follow intent per observe cycle. The physical MoveJ
+    # step is bounded separately; this is a closed-loop ceiling, not an
+    # open-loop trajectory length.
+    follow_max_semantic_step_m: float = 0.10
+    follow_max_tcp_step_m: float = 0.020
     camera_serial: str = ""
     central_x_grasp_ratio: float = 0.80
 
@@ -39,13 +185,14 @@ class GraspConfig:
     # path remains the safe fallback.
     use_npu: bool = True
     npu_server_path: str = "third_party/qnn/npu_server"
-    npu_context_path: str = "third_party/qnn/yoloe-26s-seg_640_iq9075_qnn_block4.bin"
+    recognition_profile: str = "object3"
+    npu_context_path: str = "third_party/qnn/yoloe-26s-seg_640_iq9075_qnn_object3.bin"
     npu_input_size: int = 640
     npu_output_specs: str = "output_0:1,300,38;output_1:1,32,160,160"
-    # block4 was validated on the current four-block scene.  Its weakest true
-    # block scored 0.157, while the obsolete colour-prompt brick6 context
-    # returned no candidates even at 0.15.
-    npu_confidence_threshold: float = 0.15
+    # The reference used 0.10, but a camera-only smoke test showed 3.8 FPS and
+    # many low-score bottle/box false positives.  0.20 retained both visible
+    # blocks while reaching about 7 FPS on the deployed IQ9075.
+    npu_confidence_threshold: float = 0.20
     npu_iou_threshold: float = 0.45
     npu_pre_nms_top_k: int = 50
     npu_max_detections: int = 20
@@ -182,6 +329,13 @@ class GraspConfig:
     color_accumulation_min_samples: int = 80
     color_single_frame_strong_ratio: float = 0.60
     color_track_position_tolerance_m: float = 0.020
+    color_classifier_backend: str = "lab"
+    color_calibration_file: Path = Path("config/color_calibration.json")
+    color_calibration_model: dict | None = field(default=None, repr=False)
+    # Current auto exposure shifts valid red/blue Lab centres outside the
+    # calibration's conservative one-frame radius.  Expand only the distance
+    # gate; the nearest-class margin still rejects yellow/green ambiguity.
+    color_lab_distance_scale: float = 2.5
 
     depth_surface_percentile: float = 30.0
     depth_surface_band_m: float = 0.012
@@ -250,6 +404,11 @@ class GraspConfig:
     ik_max_seed_attempts: int = 3
     move_wait_min_timeout_s: float = 6.0
     move_wait_margin_s: float = 4.0
+    # Joint-space moves use the same continuously refreshed MIT transport as
+    # Cartesian moves.  A one-shot Joint_Pos_Vel command can be consumed by the
+    # motor watchdog before HOME/PUT has made meaningful progress.
+    joint_move_settle_timeout_s: float = 1.0
+    joint_move_max_endpoint_error_rad: float = 0.20
     return_home_duration: float = 5.0
     put1_duration: float = 5.0
     put2_duration: float = 5.0
@@ -312,22 +471,124 @@ class GraspConfig:
     joint1_jog_duration: float = 3.0
     joint1_jog_posture_tolerance_rad: float = 0.20
 
-    target_prompts: tuple[str, ...] = (
-        "toy building block",
-        "plastic building block",
-        "wooden block",
-        "Lego brick",
-    )
-    # These names are baked into the deployed block4 QNN context in this exact
+    target_prompts: tuple[str, ...] = OBJECT3_CLASSES
+    # These names are baked into the deployed object3 QNN context in this exact
     # order. Changing them requires recompiling the context, not only Python.
-    npu_class_names: tuple[str, ...] = (
-        "toy building block",
-        "plastic building block",
-        "wooden block",
-        "Lego brick",
+    npu_class_names: tuple[str, ...] = OBJECT3_CLASSES
+    # Recognition and manipulation eligibility are deliberately separate.
+    # Bottle/box geometry has not yet passed gripper-width/load validation.
+    graspable_object_names: tuple[str, ...] = ("toy building block",)
+    object_grasp_profiles: dict[str, ObjectGraspProfile] = field(
+        default_factory=dict,
+        repr=False,
     )
 
+    def __post_init__(self) -> None:
+        if self.object_grasp_profiles:
+            return
+        # The block entry is a read-only description of the already validated
+        # path.  Its values are copied from the existing top-level fields so
+        # introducing profiles cannot silently change the physical behaviour.
+        self.object_grasp_profiles = {
+            "toy building block": ObjectGraspProfile(
+                object_name="toy building block",
+                motion_enabled=True,
+                plan_only=False,
+                parameters_confirmed=True,
+                preserve_legacy_pipeline=True,
+                # Metadata only for the legacy block path: one strong object3
+                # frame at the existing 0.20 threshold remains sufficient.
+                min_confidence=self.npu_confidence_threshold,
+                required_coherent_frames=1,
+                gripper_open_position_rad=self.gripper_open_position,
+                gripper_close_torque_limit=self.gripper_close_torque,
+                load_min_torque=self.grasp_min_force,
+                approach_inset_m=self.grasp_approach_overtravel_m,
+                center_strategy="segmentation_obb_center",
+                orientation_strategy="mask_obb_short_axis",
+                depth_strategy="coherent_near_surface",
+            ),
+            # Physical aperture, payload, insertion and size limits have not
+            # been supplied.  Keep both generic classes visible to recognition
+            # while making accidental motion enablement fail configuration.
+            "bottle": ObjectGraspProfile(object_name="bottle"),
+            "box": ObjectGraspProfile(object_name="box"),
+        }
+
+    def object_grasp_profile(self, object_name: str) -> ObjectGraspProfile:
+        canonical = canonical_object_name(object_name)
+        try:
+            return self.object_grasp_profiles[canonical]
+        except KeyError as exc:
+            raise KeyError(f"no grasp profile for {object_name!r}") from exc
+
+    def apply_recognition_profile(self, profile: str) -> None:
+        """Switch context, class order and threshold as one atomic profile."""
+        normalized = profile.strip().lower()
+        if normalized == "object3":
+            self.recognition_profile = normalized
+            self.npu_context_path = (
+                "third_party/qnn/yoloe-26s-seg_640_iq9075_qnn_object3.bin"
+            )
+            self.target_prompts = OBJECT3_CLASSES
+            self.npu_class_names = OBJECT3_CLASSES
+            self.npu_confidence_threshold = 0.20
+            return
+        if normalized in {"block4", "legacy_block4"}:
+            self.recognition_profile = "block4"
+            self.npu_context_path = (
+                "third_party/qnn/yoloe-26s-seg_640_iq9075_qnn_block4.bin"
+            )
+            self.target_prompts = LEGACY_BLOCK4_CLASSES
+            self.npu_class_names = LEGACY_BLOCK4_CLASSES
+            self.npu_confidence_threshold = 0.15
+            return
+        raise ValueError("VISION_MODEL_PROFILE must be 'object3' or 'block4'")
+
     def validate(self) -> None:
+        if self.recognition_profile not in {"object3", "block4"}:
+            raise ValueError("invalid recognition profile")
+        expected_classes = (
+            OBJECT3_CLASSES
+            if self.recognition_profile == "object3"
+            else LEGACY_BLOCK4_CLASSES
+        )
+        if tuple(self.npu_class_names) != expected_classes:
+            raise ValueError(
+                "NPU class order does not match the selected recognition profile"
+            )
+        if self.color_classifier_backend not in {"lab", "hsv"}:
+            raise ValueError("COLOR_CLASSIFIER must be 'lab' or 'hsv'")
+        if not 1.0 <= self.color_lab_distance_scale <= 2.5:
+            raise ValueError("Lab distance scale must be between 1.0 and 2.5")
+        if not self.graspable_object_names:
+            raise ValueError("at least one graspable object class is required")
+        canonical_profiles = {
+            canonical_object_name(name): profile
+            for name, profile in self.object_grasp_profiles.items()
+        }
+        if set(canonical_profiles) != set(OBJECT3_CLASSES):
+            raise ValueError(
+                "object_grasp_profiles must define bottle, box and toy building block"
+            )
+        for name, profile in canonical_profiles.items():
+            if canonical_object_name(profile.object_name) != name:
+                raise ValueError(f"object grasp profile key/name mismatch for {name!r}")
+            profile.validate()
+        graspable = {
+            canonical_object_name(name) for name in self.graspable_object_names
+        }
+        recognised = {
+            canonical_object_name(name) for name in self.npu_class_names
+        }
+        if not graspable.issubset(recognised):
+            raise ValueError(
+                "graspable objects must be present in the selected recognition profile"
+            )
+        for name in graspable:
+            profile = canonical_profiles.get(name)
+            if profile is None or not profile.motion_ready:
+                raise ValueError(f"{name} is graspable but its profile is not motion-ready")
         if self.approach_policy not in {"seeed_safe", "seeed_pure"}:
             raise ValueError("approach_policy must be 'seeed_safe' or 'seeed_pure'")
         if not np.all(
@@ -473,12 +734,23 @@ class GraspConfig:
             and self.detection_stationary_timeout > 0.0
         ):
             raise ValueError("invalid camera timing or stationary settings")
+        if not 0.0 < self.follow_max_semantic_step_m <= 0.10:
+            raise ValueError("follow_max_semantic_step_m must be in (0, 100 mm]")
+        if not 0.0 < self.follow_max_tcp_step_m <= 0.020:
+            raise ValueError("follow_max_tcp_step_m must be in (0, 20 mm]")
+        if not 1.0 <= self.stream_preview_fps <= 30.0:
+            raise ValueError("stream_preview_fps must be between 1 and 30")
         if self.zero_move_timeout <= 0.0:
             raise ValueError("zero_move_timeout must be positive")
         if self.ik_single_seed_max_iterations < 50 or self.ik_max_seed_attempts < 1:
             raise ValueError("invalid bounded IK settings")
         if self.move_wait_min_timeout_s <= 0.0 or self.move_wait_margin_s <= 0.0:
             raise ValueError("invalid bounded move timeout settings")
+        if (
+            self.joint_move_settle_timeout_s <= 0.0
+            or not 0.05 <= self.joint_move_max_endpoint_error_rad <= 0.20
+        ):
+            raise ValueError("invalid dense joint-move feedback limits")
         if (
             self.direct_grasp_joint_tolerance_rad <= 0.0
             or self.direct_grasp_tcp_tolerance_m <= 0.0
@@ -505,7 +777,28 @@ COLOR_ALIASES = {
     "black": ("black", "\u9ed1"),
 }
 ANY_COLOR_ALIASES = ("any", "all", "\u4efb\u610f", "\u6240\u6709", "\u5168\u90e8")
+OBJECT_ALIASES = {
+    "toy building block": (
+        "toybuildingblock",
+        "buildingblock",
+        "block",
+        "legobrick",
+        "lego",
+        "\u79ef\u6728",
+        "\u79ef\u6728\u5757",
+        "\u4e50\u9ad8",
+    ),
+    "bottle": ("bottle", "\u74f6\u5b50", "\u74f6", "\u6c34\u74f6"),
+    "box": ("box", "\u76d2\u5b50", "\u76d2", "\u7eb8\u76d2"),
+}
+ANY_OBJECT_ALIASES = ("anyobject", "anything", "\u4efb\u610f\u7269\u4f53", "\u4efb\u4f55\u7269\u4f53")
 NEGATION_PREFIXES = (
+    "\u4e0d\u8981",
+    "\u522b\u6293",
+    "\u522b\u8981",
+    "\u6392\u9664",
+    "\u4e0d\u662f",
+    "\u4e0d\u6293",
     "不要",
     "别抓",
     "别要",
@@ -523,36 +816,92 @@ def _token_is_negated(normalized: str, token_index: int) -> bool:
     return any(prefix.endswith(negation) for negation in NEGATION_PREFIXES)
 
 
-def parse_target_command(command: str):
-    """Return ``(color_name_or_None, accepted)`` from a terminal/speech command."""
-    normalized = command.strip().lower().replace(" ", "")
-    if not normalized:
-        return None, False
-
-    any_positions = [
-        normalized.find(token)
-        for token in ANY_COLOR_ALIASES
-        if token in normalized
-    ]
-    if any(
-        position >= 0 and not _token_is_negated(normalized, position)
-        for position in any_positions
-    ):
-        return None, True
-
-    positive_colors: list[tuple[int, str]] = []
-    for name, aliases in COLOR_ALIASES.items():
+def _find_alias_matches(normalized: str, aliases_by_name):
+    """Return ordered ``(index, canonical_name, negated)`` alias matches."""
+    matches: list[tuple[int, str, bool]] = []
+    for name, aliases in aliases_by_name.items():
         for alias in aliases:
             start = 0
             while True:
                 index = normalized.find(alias, start)
                 if index < 0:
                     break
-                if not _token_is_negated(normalized, index):
-                    positive_colors.append((index, name))
+                matches.append((index, name, _token_is_negated(normalized, index)))
                 start = index + len(alias)
+    matches.sort(key=lambda item: item[0])
+    return matches
 
-    if not positive_colors:
+
+def _distinct_alias_names(matches, *, negated: bool) -> list[str]:
+    names = []
+    for _index, name, is_negated in matches:
+        if is_negated == negated and name not in names:
+            names.append(name)
+    return names
+
+
+def _contains_positive_alias(normalized: str, aliases) -> bool:
+    for alias in aliases:
+        start = 0
+        while True:
+            index = normalized.find(alias, start)
+            if index < 0:
+                break
+            if not _token_is_negated(normalized, index):
+                return True
+            start = index + len(alias)
+    return False
+
+
+def parse_target_request(command: str):
+    """Return ``(TargetRequest, accepted)`` from terminal/speech text.
+
+    A colour-only command intentionally means a coloured building block, which
+    preserves the old UI while preventing an object3 detection of a same-colour
+    bottle or box from becoming a motion target.
+    """
+    normalized = command.strip().lower().replace(" ", "")
+    if not normalized:
         return None, False
-    positive_colors.sort(key=lambda item: item[0])
-    return positive_colors[0][1], True
+
+    color_matches = _find_alias_matches(normalized, COLOR_ALIASES)
+    object_matches = _find_alias_matches(normalized, OBJECT_ALIASES)
+    positive_colors = _distinct_alias_names(color_matches, negated=False)
+    negative_colors = _distinct_alias_names(color_matches, negated=True)
+    positive_objects = _distinct_alias_names(object_matches, negated=False)
+    negative_objects = _distinct_alias_names(object_matches, negated=True)
+    any_color = _contains_positive_alias(normalized, ANY_COLOR_ALIASES)
+    any_object = _contains_positive_alias(normalized, ANY_OBJECT_ALIASES)
+
+    # The control surface accepts exactly one positive object and one positive
+    # colour.  Never guess which noun/adjective belongs together in a compound
+    # command such as "red bottle and blue box".
+    if (
+        len(positive_colors) > 1
+        or len(positive_objects) > 1
+        or (any_color and positive_colors)
+        or (any_object and positive_objects)
+    ):
+        return None, False
+    # Exclusions are supported only when the same dimension also has one
+    # explicit positive replacement.  Thus "不要红色瓶子" cannot silently turn
+    # into an unrestricted bottle request.
+    if (
+        (negative_colors and not positive_colors and not any_color)
+        or (negative_objects and not positive_objects and not any_object)
+    ):
+        return None, False
+
+    color = positive_colors[0] if positive_colors else None
+    object_name = positive_objects[0] if positive_objects else None
+    if color is None and object_name is None and not any_color and not any_object:
+        return None, False
+    if object_name is None and not any_object:
+        object_name = "toy building block"
+    return TargetRequest(object_name=object_name, color=color), True
+
+
+def parse_target_command(command: str):
+    """Compatibility wrapper returning the legacy ``(colour, accepted)``."""
+    request, accepted = parse_target_request(command)
+    return (request.color if request is not None else None), accepted

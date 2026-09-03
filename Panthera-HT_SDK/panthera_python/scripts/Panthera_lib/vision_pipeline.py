@@ -13,6 +13,31 @@ import numpy as np
 import pyrealsense2 as rs
 
 from .grasp_config import GraspConfig
+from .lab_color import (
+    classify_lab_features,
+    extract_lab_feature,
+    load_color_calibration,
+)
+
+
+def load_color_model(config: GraspConfig):
+    """Load the selected colour backend before camera/robot ownership starts."""
+    if config.color_classifier_backend == "hsv":
+        config.color_calibration_model = None
+        print("[VISION] colour classifier: legacy HSV fallback", flush=True)
+        return None
+    calibration_path = Path(config.color_calibration_file)
+    if not calibration_path.is_absolute():
+        calibration_path = Path(config.project_root) / calibration_path
+    model = load_color_calibration(calibration_path)
+    config.color_calibration_file = calibration_path
+    config.color_calibration_model = model
+    print(
+        "[VISION] colour classifier: calibrated Lab "
+        f"({calibration_path})",
+        flush=True,
+    )
+    return model
 
 
 def load_hand_eye(config: GraspConfig) -> np.ndarray:
@@ -99,6 +124,7 @@ class CameraFeed:
 
         self._latest_capture: dict | None = None
         self._latest_for_scan: dict | None = None
+        self._object_inference_enabled = True
         self._detections: list = []
         self._detections_timestamp = 0.0
         self._capture_sequence = 0
@@ -118,6 +144,24 @@ class CameraFeed:
 
     def set_npu_detector(self, detector) -> None:
         self.npu_detector = detector
+
+    def set_object_inference_enabled(self, enabled: bool) -> None:
+        """Pause/resume object inference while raw RGB-D capture keeps running.
+
+        CPU hand following owns the annotated preview while active.  Pausing the
+        object worker prevents stale object boxes from overwriting hand overlays
+        and avoids running CPU hand inference concurrently with NPU postprocess.
+        Resuming always requires a newly completed object snapshot before grasp
+        planning can continue.
+        """
+        with self._lock:
+            self._object_inference_enabled = bool(enabled)
+            self._latest_for_scan = None
+            self._detections = []
+            self._detections_timestamp = 0.0
+            self._last_inference_capture_sequence = -1
+            if enabled:
+                self._last_inference_start_time = 0.0
 
     def start(self) -> None:
         self._capture_thread = threading.Thread(
@@ -156,6 +200,38 @@ class CameraFeed:
             snapshot["detections"] = list(snapshot["detections"])
             return snapshot
 
+    def latest_capture(self):
+        """Return the newest immutable RGB-D capture without waiting for YOLO.
+
+        Hand following runs a separate CPU detector.  Feeding it the most recent
+        camera capture avoids adding the object detector's latency before the
+        already-slow CPU hand inference.  Capture arrays are replaced, never
+        mutated, by ``_capture_loop`` so a shallow dictionary copy is enough.
+        """
+        with self._lock:
+            if self._latest_capture is None:
+                return None
+            return dict(self._latest_capture)
+
+    def capture_freshness_marker(self) -> int:
+        """Return the newest raw-capture sequence, or -1 before startup."""
+        with self._lock:
+            if self._latest_capture is None:
+                return -1
+            return int(self._latest_capture["frame_seq"])
+
+    def wait_for_new_capture(self, after_sequence: int, timeout: float = 1.0):
+        """Wait for a raw RGB-D capture newer than ``after_sequence``."""
+        deadline = time.monotonic() + float(timeout)
+        while not self._stop_event.is_set():
+            capture = self.latest_capture()
+            if capture is not None and int(capture["frame_seq"]) > int(after_sequence):
+                return capture
+            if time.monotonic() >= deadline:
+                return None
+            time.sleep(0.005)
+        return None
+
     def freshness_marker(self) -> int:
         """Return the last completed inference sequence, or -1 before startup."""
         with self._lock:
@@ -185,7 +261,7 @@ class CameraFeed:
         capture: dict,
         detections: list,
         inference_latency: float = 0.0,
-    ) -> None:
+    ) -> dict | None:
         """Publish one immutable, frame-consistent RGB-D/detection snapshot."""
         snapshot = {
             "color_image": capture["color_image"],
@@ -200,6 +276,11 @@ class CameraFeed:
             "snapshot_age_s": float(time.monotonic() - capture["timestamp"]),
         }
         with self._lock:
+            if not self._object_inference_enabled:
+                # A request may pause object inference while an NPU call is
+                # already in flight.  Discard that late result so it cannot
+                # overwrite the hand-follow preview or become a grasp snapshot.
+                return None
             self._detections = list(detections)
             self._detections_timestamp = capture["timestamp"]
             self._last_inference_capture_sequence = capture["frame_seq"]
@@ -207,6 +288,27 @@ class CameraFeed:
             self._last_inference_latency = float(inference_latency)
             self._performance_inference_count += 1
             self._latest_for_scan = snapshot
+            return snapshot
+
+    def _publish_object_snapshot_if_current(self, snapshot: dict) -> bool:
+        """Prevent an in-flight object result from replacing a hand overlay."""
+        if self.streamer is None:
+            return False
+        # Keep this lock through the short frame copy.  Once a hand-mode pause
+        # returns, no earlier object result can still publish afterward.
+        with self._lock:
+            if (
+                not self._object_inference_enabled
+                or self._latest_for_scan is not snapshot
+            ):
+                return False
+            self.streamer.publish(
+                snapshot["color_image"],
+                snapshot["detections"],
+                depth_image=snapshot["depth_image"],
+                depth_scale=self.depth_scale,
+            )
+            return True
 
     def _capture_loop(self) -> None:
         while not self._stop_event.is_set():
@@ -233,6 +335,13 @@ class CameraFeed:
                         "capture_timestamp_ns": capture_timestamp_ns,
                         "frame_seq": self._capture_sequence,
                     }
+                # Keep the operator's raw/depth preview independent from the
+                # detector cadence. The streamer stores only the newest frame;
+                # slow browsers never back-pressure RealSense capture.
+                if self.streamer is not None:
+                    publish_raw = getattr(self.streamer, "publish_capture", None)
+                    if callable(publish_raw):
+                        publish_raw(color_image, depth_image, self.depth_scale)
                 # Do not overlay detections from an older inference on this new
                 # capture. The inference thread publishes the coherent RGB-D +
                 # detections snapshot after processing the same frame.
@@ -244,6 +353,11 @@ class CameraFeed:
 
     def _inference_loop(self) -> None:
         while not self._stop_event.is_set():
+            with self._lock:
+                inference_enabled = self._object_inference_enabled
+            if not inference_enabled:
+                time.sleep(0.02)
+                continue
             model = self.model
             if model is None and self.npu_detector is None:
                 time.sleep(0.02)
@@ -286,6 +400,8 @@ class CameraFeed:
                         self.config,
                     )
             except Exception as exc:
+                if self._stop_event.is_set():
+                    break
                 self._report_error(exc)
                 with self._lock:
                     self._last_inference_capture_sequence = capture["frame_seq"]
@@ -296,16 +412,15 @@ class CameraFeed:
                 continue
 
             inference_latency = time.monotonic() - inference_started
-            self._store_inference_result(capture, detections, inference_latency)
+            snapshot = self._store_inference_result(
+                capture,
+                detections,
+                inference_latency,
+            )
+            if snapshot is None:
+                continue
             self._report_performance(len(detections))
-
-            if self.streamer is not None:
-                self.streamer.publish(
-                    color_image,
-                    detections,
-                    depth_image=depth_image,
-                    depth_scale=self.depth_scale,
-                )
+            self._publish_object_snapshot_if_current(snapshot)
 
     def _report_performance(self, detection_count: int) -> None:
         now = time.monotonic()
@@ -423,10 +538,28 @@ def adaptive_color_core(mask, config: GraspConfig):
 
 
 def extract_color_evidence(bgr_image, mask, config: GraspConfig):
-    """Return raw HSV counts that can be safely merged across matched frames."""
+    """Return backend-neutral evidence mergeable across matched frames."""
+    if (
+        config.color_classifier_backend == "lab"
+        and config.color_calibration_model is not None
+    ):
+        feature = extract_lab_feature(bgr_image, mask)
+        if feature is not None:
+            feature = dict(feature)
+            # A full-resolution diagnostic mask would multiply memory use while
+            # accumulating frames; all classification inputs are already in the
+            # compact Lab values above.
+            feature.pop("valid_mask", None)
+        return {
+            "backend": "lab",
+            "lab_features": [] if feature is None else [feature],
+            "core_pixels": 0 if feature is None else int(feature["core_pixels"]),
+        }
+
     core = adaptive_color_core(mask, config)
     pixels = bgr_image[core.astype(bool)]
     evidence = {
+        "backend": "hsv",
         "core_pixels": int(len(pixels)),
         "dark": 0,
         "white": 0,
@@ -465,7 +598,20 @@ def extract_color_evidence(bgr_image, mask, config: GraspConfig):
 
 
 def merge_color_evidence(items):
+    items = list(items)
+    if items and any(item.get("backend") == "lab" for item in items):
+        features = []
+        for evidence in items:
+            features.extend(evidence.get("lab_features", []))
+        return {
+            "backend": "lab",
+            "lab_features": features,
+            "core_pixels": int(
+                sum(int(item.get("core_pixels", 0)) for item in items)
+            ),
+        }
     merged = {
+        "backend": "hsv",
         "core_pixels": 0,
         "dark": 0,
         "white": 0,
@@ -484,6 +630,14 @@ def merge_color_evidence(items):
 
 def classify_color_evidence(evidence, config: GraspConfig):
     """Return color, confidence, usable samples and top-two vote margin."""
+    if evidence.get("backend") == "lab":
+        color, confidence, samples, margin, _diagnostics = classify_lab_features(
+            evidence.get("lab_features", []),
+            config.color_calibration_model,
+            distance_scale=config.color_lab_distance_scale,
+        )
+        return color, confidence, samples, margin
+
     core_pixels = int(evidence["core_pixels"])
     if core_pixels <= 0:
         return "unknown", 0.0, 0, 0.0
@@ -523,6 +677,7 @@ def apply_accumulated_color(detection, evidence_items, matched_frames, config):
             "color_frames": int(matched_frames),
             "color_samples": int(sample_count),
             "color_margin": float(margin),
+            "color_method": merged.get("backend", "hsv"),
         }
     )
     return updated
@@ -633,6 +788,7 @@ def _detection_from_result(name, conf, bbox, mask, color_image, depth_frame, dep
         "color_frames": 1,
         "color_samples": color_samples,
         "color_margin": color_margin,
+        "color_method": color_evidence.get("backend", "hsv"),
         # Use the segmentation OBB centre as the grasp ray.  The previous
         # near-depth pixel was consistently on the camera-nearest end of a
         # tilted brick, which made the otherwise-correct jaw pose grab its

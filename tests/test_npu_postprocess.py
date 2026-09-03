@@ -23,6 +23,21 @@ class NpuPostprocessTests(unittest.TestCase):
 
         self.assertEqual(kept, [0, 2])
 
+    def test_nms_keeps_overlapping_different_object_classes(self):
+        boxes = np.array([[0, 0, 100, 100], [2, 2, 98, 98]], dtype=np.float32)
+        scores = np.array([0.95, 0.90], dtype=np.float32)
+
+        kept = NpuYoloDetector._nms_indices(
+            boxes,
+            scores,
+            0.45,
+            50,
+            20,
+            labels=np.array([0, 1]),
+        )
+
+        self.assertEqual(kept, [0, 1])
+
     def test_decode_rejects_invalid_labels_and_off_image_boxes(self):
         detector = NpuYoloDetector.__new__(NpuYoloDetector)
         detector.names = ("a", "b", "c", "d")

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run TASK-003 offline unit tests without pytest or hardware access."""
+"""Run the project offline unit tests without pytest or hardware access."""
 
 from __future__ import annotations
 

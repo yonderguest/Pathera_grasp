@@ -6,7 +6,7 @@ from unittest.mock import patch
 
 import numpy as np
 
-from Panthera_lib.grasp_config import GraspConfig
+from Panthera_lib.grasp_config import GraspConfig, TargetRequest
 from Panthera_lib.grasp_planner import (
     GraspPlanner,
     RobotLifecycleState,
@@ -114,6 +114,94 @@ class PlannerSafetyTests(unittest.TestCase):
         )
 
         self.assertEqual(robot.kwargs["tolerance"], 0.02)
+
+    def test_home_uses_continuously_refreshed_dense_joint_trajectory(self):
+        class Robot:
+            def __init__(self):
+                self.position = np.zeros(6)
+                self.velocity = np.zeros(6)
+                self.trajectory = None
+                self.kwargs = None
+                self.hold_count = 0
+
+            def current_joint_position(self):
+                return self.position.copy()
+
+            def get_current_vel(self):
+                return self.velocity.copy()
+
+            def refresh_motor_state(self):
+                return None
+
+            def execute_joint_trajectory_checked(self, trajectory, **kwargs):
+                self.trajectory = np.asarray(trajectory, dtype=float)
+                self.kwargs = kwargs
+                self.position = self.trajectory[-1].copy()
+                return True
+
+            def hold_joints_mit_once(self, joints, _max_torque):
+                self.hold_count += 1
+                self.position = np.asarray(joints, dtype=float).copy()
+                return True
+
+            @staticmethod
+            def Joint_Pos_Vel(*_args, **_kwargs):
+                raise AssertionError("dense HOME must remain in MIT mode")
+
+            def move_j_checked(self, *_args, **_kwargs):
+                raise AssertionError("dense-capable robot used one-shot moveJ")
+
+        robot = Robot()
+        config = GraspConfig()
+        planner = GraspPlanner(robot, config, threading.Event())
+
+        planner.home()
+
+        self.assertTrue(np.allclose(robot.trajectory[0], np.zeros(6)))
+        self.assertTrue(np.allclose(robot.trajectory[-1], config.home))
+        self.assertEqual(robot.kwargs["label"], "HOME")
+        self.assertEqual(
+            robot.kwargs["control_period"],
+            config.trajectory_control_period_s,
+        )
+        self.assertEqual(planner._control_mode, "mit")
+        hold_count = robot.hold_count
+        with planner.hold_current_pose("post-HOME camera wait"):
+            threading.Event().wait(0.06)
+        self.assertGreater(robot.hold_count, hold_count)
+        self.assertEqual(planner.lifecycle_state, RobotLifecycleState.HOMED)
+
+    def test_dense_joint_move_rejects_large_endpoint_tracking_error(self):
+        class Robot:
+            def __init__(self):
+                self.position = np.zeros(6)
+                self.held = None
+
+            def current_joint_position(self):
+                return self.position.copy()
+
+            @staticmethod
+            def get_current_vel():
+                return np.zeros(6)
+
+            def refresh_motor_state(self):
+                return None
+
+            @staticmethod
+            def execute_joint_trajectory_checked(_trajectory, **_kwargs):
+                return True
+
+            def hold_joints_mit_once(self, joints, _max_torque):
+                self.held = np.asarray(joints, dtype=float).copy()
+                return True
+
+        robot = Robot()
+        planner = GraspPlanner(robot, GraspConfig(), threading.Event())
+
+        with self.assertRaisesRegex(RuntimeError, "tracking error is unsafe"):
+            planner.move_j(np.ones(6), 3.0, "NO PROGRESS")
+
+        self.assertTrue(np.allclose(robot.held, np.zeros(6)))
 
     def test_edge_visible_block_is_inside_expanded_image_region(self):
         planner = GraspPlanner(NoopRobot(), GraspConfig(), threading.Event())
@@ -648,7 +736,7 @@ class PlannerSafetyTests(unittest.TestCase):
         config = GraspConfig()
         config.refine_frame_warmup = 1
         config.refine_required_observations = 3
-        config.refine_max_frame_attempts = 3
+        config.refine_max_frame_attempts = 5
         planner = GraspPlanner(NoopRobot(), config, threading.Event())
         planner.wait_until_stationary = lambda: np.zeros(6)
         planner.current_joint_position = lambda: np.zeros(6)
@@ -660,6 +748,7 @@ class PlannerSafetyTests(unittest.TestCase):
 
         def capture(sequence, point):
             detection = {
+                "class_name": "toy building block",
                 "pixel": (320.0, 240.0),
                 "color": "red",
                 "point": np.asarray(point, dtype=float),
@@ -677,8 +766,10 @@ class PlannerSafetyTests(unittest.TestCase):
             [
                 capture(1, [0.300, 0.000, 0.100]),
                 capture(2, [0.302, 0.001, 0.101]),
-                capture(3, [0.299, -0.001, 0.100]),
-                capture(4, [0.301, 0.000, 0.099]),
+                capture(3, [0.318, -0.001, 0.100]),
+                capture(4, [0.301, 0.000, 0.118]),
+                capture(5, [0.299, -0.001, 0.100]),
+                capture(6, [0.301, 0.000, 0.099]),
             ]
         )
 
@@ -700,6 +791,7 @@ class PlannerSafetyTests(unittest.TestCase):
             "scan_joint_position": np.zeros(6),
             "scan_joint1": 0.0,
             "detected_color": "red",
+            "detected_object": "toy building block",
         }
         with (
             patch(
@@ -754,6 +846,7 @@ class PlannerSafetyTests(unittest.TestCase):
 
         def capture(sequence, point):
             detection = {
+                "class_name": "toy building block",
                 "pixel": (320.0, 240.0),
                 "bbox": (280, 200, 360, 280),
                 "color": "blue",
@@ -839,6 +932,7 @@ class PlannerSafetyTests(unittest.TestCase):
 
         def detection(red, blue):
             return {
+                "class_name": "toy building block",
                 "color": "unknown",
                 "color_confidence": 0.0,
                 "color_evidence": {
@@ -879,6 +973,137 @@ class PlannerSafetyTests(unittest.TestCase):
         self.assertEqual(marker, 2)
         self.assertEqual(accumulated["color"], "red")
         self.assertEqual(accumulated["color_frames"], 2)
+
+    def test_color_accumulation_never_switches_to_same_colour_other_object(self):
+        config = GraspConfig()
+        config.color_accumulation_max_frames = 2
+        planner = GraspPlanner(NoopRobot(), config, threading.Event())
+
+        def detection(class_name, red, blue):
+            return {
+                "class_name": class_name,
+                "color": "unknown",
+                "color_confidence": 0.0,
+                "color_evidence": {
+                    "core_pixels": red + blue,
+                    "dark": 0,
+                    "white": 0,
+                    "chromatic_pixels": red + blue,
+                    "votes": {
+                        "red": red,
+                        "yellow": 0,
+                        "green": 0,
+                        "blue": blue,
+                    },
+                },
+            }
+
+        block = detection("toy building block", 30, 30)
+        red_bottle = detection("bottle", 60, 0)
+
+        class Feed:
+            @staticmethod
+            def wait_for_newer(_marker, timeout):
+                return {"frame_seq": 2, "detections": [red_bottle]}
+
+        with patch(
+            "Panthera_lib.grasp_planner.object_base_position",
+            return_value=(np.zeros(3), np.array([0.3, 0.0, 0.1])),
+        ):
+            accumulated, _marker = planner._accumulate_candidate_color(
+                Feed(),
+                block,
+                intrinsic=None,
+                base_camera=np.eye(4),
+                requested_color="red",
+                after_sequence=1,
+            )
+
+        self.assertEqual(accumulated["color_frames"], 1)
+        self.assertEqual(accumulated["color"], "unknown")
+
+    def test_object_only_request_preserves_block_gate_but_allows_generic_preview(self):
+        self.assertFalse(GraspPlanner._color_matches_request("unknown", None))
+        self.assertTrue(
+            GraspPlanner._color_matches_request(
+                "unknown",
+                None,
+                allow_unknown_color=True,
+            )
+        )
+        self.assertTrue(GraspPlanner._color_matches_request("green", None))
+        self.assertTrue(GraspPlanner._color_matches_request("green", "green"))
+        self.assertFalse(GraspPlanner._color_matches_request("unknown", "green"))
+        self.assertFalse(GraspPlanner._color_matches_request("red", "green"))
+
+    def test_object_only_detection_keeps_unknown_colour_bottle_for_plan_only(self):
+        planner = GraspPlanner(NoopRobot(), GraspConfig(), threading.Event())
+        planner.wait_until_stationary = lambda: np.zeros(6)
+        planner.current_joint_position = lambda: np.zeros(6)
+        planner.validate_candidate = lambda *args, **kwargs: np.ones(6)
+        detection = {
+            "class_name": "bottle",
+            "color": "unknown",
+            "color_confidence": 0.0,
+            "color_frames": 1,
+            "color_samples": 0,
+            "color_margin": 0.0,
+            "confidence": 0.8,
+            "bbox": (280, 200, 360, 300),
+            "pixel": (320.0, 250.0),
+            "depth_m": 0.3,
+            "depth_samples": 100,
+            "depth_spread_m": 0.002,
+        }
+        planner._accumulate_candidate_color = (
+            lambda _feed, candidate, *_args, **_kwargs: (candidate, 2)
+        )
+
+        class Feed:
+            @staticmethod
+            def freshness_marker():
+                return 1
+
+            @staticmethod
+            def wait_for_newer(_marker, timeout):
+                return {
+                    "frame_seq": 2,
+                    "detections_timestamp": 2.0,
+                    "inference_latency_s": 0.01,
+                    "snapshot_age_s": 0.01,
+                    "detections": [detection],
+                }
+
+        with (
+            patch(
+                "Panthera_lib.grasp_planner.get_base_camera_transform",
+                return_value=np.eye(4),
+            ),
+            patch(
+                "Panthera_lib.grasp_planner.object_base_position",
+                return_value=(np.array([0.0, 0.0, 0.3]), np.array([0.3, 0.0, 0.1])),
+            ),
+            patch(
+                "Panthera_lib.grasp_planner.grasp_rotation_from_mask",
+                return_value=(np.eye(3), 0.0, 0.0, 0.0, 0.0),
+            ),
+            patch(
+                "Panthera_lib.grasp_planner.grasp_geometry",
+                return_value=(np.array([0.3, 0.0, 0.1]), np.array([0.2, 0.0, 0.1])),
+            ),
+        ):
+            result = planner._detect_at_pose(
+                Feed(),
+                intrinsic=object(),
+                tcp_camera=np.eye(4),
+                selected_color=TargetRequest("bottle", None),
+                joint1=0.0,
+                label="PLAN-ONLY",
+            )
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result["detected_object"], "bottle")
+        self.assertEqual(result["detected_color"], "unknown")
 
     def test_scan_does_not_accumulate_irrelevant_strong_colours(self):
         planner = GraspPlanner(NoopRobot(), GraspConfig(), threading.Event())
@@ -1285,6 +1510,60 @@ class PlannerSafetyTests(unittest.TestCase):
             )
         )
         self.assertTrue(np.allclose(robot.move_targets[0], startup))
+        self.assertEqual(robot.stop_calls, 1)
+
+    def test_shutdown_prefers_dense_trajectory_when_robot_supports_it(self):
+        class ShutdownRobot:
+            def __init__(self):
+                self.position = np.zeros(6)
+                self.velocity = np.zeros(6)
+                self.dense_targets = []
+                self.stop_calls = 0
+
+            def current_joint_position(self):
+                return self.position.copy()
+
+            def get_current_pos(self):
+                return self.position.copy()
+
+            def get_current_vel(self):
+                return self.velocity.copy()
+
+            def refresh_motor_state(self):
+                return None
+
+            def execute_joint_trajectory_checked(self, trajectory, **_kwargs):
+                trajectory = np.asarray(trajectory, dtype=float)
+                self.dense_targets.append(trajectory[-1].copy())
+                self.position = trajectory[-1].copy()
+                return True
+
+            def hold_joints_mit_once(self, joints, _max_torque):
+                self.position = np.asarray(joints, dtype=float).copy()
+                return True
+
+            def moveJ(self, *_args, **_kwargs):
+                raise AssertionError("shutdown used one-shot moveJ")
+
+            def set_stop(self):
+                self.stop_calls += 1
+
+        config = GraspConfig()
+        config.zero_settle_time = 0.0
+        config.zero_stable_samples = 1
+        config.zero_verify_timeout = 0.2
+        startup = np.array([0.1, 0.3, 1.0, -1.2, 0.1, -0.1])
+        robot = ShutdownRobot()
+        planner = GraspPlanner(robot, config, threading.Event())
+
+        self.assertTrue(
+            planner.safe_shutdown(
+                None,
+                shutdown_target=startup,
+                shutdown_label="STARTUP POSE",
+            )
+        )
+        self.assertTrue(np.allclose(robot.dense_targets[0], startup))
         self.assertEqual(robot.stop_calls, 1)
 
     def test_shutdown_feedback_failure_never_replays_stale_home(self):
