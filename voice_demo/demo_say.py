@@ -2,9 +2,10 @@
 """最小 demo：语音播报。
 
 三种后端：
-  - 默认：edge-tts 在线合成
+  - 默认：sherpa-onnx VITS 离线合成
   - --offline <wav>：直接播放预录音频
-  - --sherpa：sherpa-onnx 离线合成（VITS，断网可用）
+  - --sherpa：显式选择 sherpa-onnx 离线合成（VITS，断网可用）
+  - --edge：edge-tts 在线合成
 """
 from __future__ import annotations
 

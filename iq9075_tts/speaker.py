@@ -106,7 +106,14 @@ class Speaker:
                 continue
             if text is None:
                 break
-            tmp_path = tempfile.mktemp(suffix=getattr(self.backend, "output_suffix", ".mp3"))
+            # Put the backend output inside an atomically created private
+            # directory.  The output path itself must not exist yet because
+            # OfflineWavBackend uses that fact to select its prerecorded file.
+            tmp_dir = tempfile.mkdtemp(prefix="iq9075_tts_")
+            tmp_path = os.path.join(
+                tmp_dir,
+                "speech" + getattr(self.backend, "output_suffix", ".mp3"),
+            )
             try:
                 if not self.backend.synthesize(text, tmp_path):
                     print(f"[tts] 合成失败: {text[:20]}")
@@ -131,6 +138,10 @@ class Speaker:
                         self._player = None
                 try:
                     os.remove(tmp_path)
+                except Exception:
+                    pass
+                try:
+                    os.rmdir(tmp_dir)
                 except Exception:
                     pass
 

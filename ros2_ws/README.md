@@ -1,97 +1,93 @@
-# Panthera ROS2 分离工作区
+# Panthera ROS2 备选工作区（暂停使用）
 
-> 当前项目在同一台 IQ9075 上运行，现场主线已切回根目录 `grasp_demo.py`。本工作区暂停使用，仅为未来跨进程或跨机器部署保留。
+当前正式入口是仓库根目录 `grasp_demo.py`。本工作区保存早期将语音、视觉、推流和抓取大脑拆成 ROS2 节点的兼容代码，仅供未来跨进程或跨机器部署参考；不得与单进程入口同时启动，也不属于当前实机验收范围。
 
-这是 `grasp_demo.py` 的候选分离式入口。它包含四个节点和一个 bringup 包：
+## 重要兼容性警告
 
-| 节点 | 包 | 职责 |
+当前单进程规划器已经采用 `FULL_LOAD → 操作者点击放置 → PUT2/PUT1` 的两阶段流程，而 `panthera_grasp_brain` 仍未实现相应的 ROS 放置命令/回调。它不能完成现行持物待放状态机。
+
+**在补齐放置接口、停止语义和回归测试前，不要启动 ROS2 grasp brain 驱动真实机械臂。** 离线测试只验证消息契约、帧同步、QoS 和生命周期片段，不代表 ROS2 实机链已恢复。
+
+## 包结构
+
+| 包 | 职责 | 文档 |
 |---|---|---|
-| 语音 | `panthera_voice` | ASR listen、TTS say、半双工录音 |
-| 视觉 | `panthera_vision` | RealSense、YOLOE、RGB-D/检测发布 |
-| 推流 | `panthera_stream` | 独立 MJPEG 服务 |
-| 抓取大脑 | `panthera_grasp_brain` | 独占机械臂，消费同步快照并复用 `GraspPlanner` |
-| 启动 | `grasp_bringup` | launch 参数和节点装配 |
+| `panthera_voice` | ASR listen、TTS say 与语音状态 | [说明](src/panthera_voice/README.md) |
+| `panthera_vision` | RealSense、YOLOE、RGB-D/检测发布 | [说明](src/panthera_vision/README.md) |
+| `panthera_stream` | 订阅图像并提供独立 MJPEG 页面 | [说明](src/panthera_stream/README.md) |
+| `panthera_grasp_brain` | 消费同步快照并拥有机械臂 | [说明](src/panthera_grasp_brain/README.md) |
+| `grasp_bringup` | launch 参数与节点装配 | [说明](src/grasp_bringup/README.md) |
 
-当前工作区还未纳入 Git。它不得与根目录单体 `grasp_demo.py` 同时运行，否则会争用相机、语音和机械臂。
-
-## Topic 兼容性与帧同步
-
-以下原有 topic 未改名、未改消息类型：
+## Topic
 
 ```text
-/vision/image_raw        sensor_msgs/Image
-/vision/depth_image      sensor_msgs/Image
-/vision/annotated        sensor_msgs/Image
-/vision/detections       std_msgs/String（JSON list）
-/vision/camera_info      std_msgs/String（JSON）
-/voice/listen_request    std_msgs/Bool
-/voice/command           std_msgs/String
-/voice/say               std_msgs/String
-/arm/status              std_msgs/String
+/vision/image_raw           sensor_msgs/Image
+/vision/depth_image         sensor_msgs/Image
+/vision/annotated           sensor_msgs/Image
+/vision/detections          std_msgs/String   # 旧 JSON list
+/vision/detections_stamped  std_msgs/String   # 带 frame_seq/timestamp 的 JSON
+/vision/camera_info         std_msgs/String   # JSON，transient-local
+/voice/listen_request       std_msgs/Bool
+/voice/command              std_msgs/String
+/voice/say                  std_msgs/String
+/arm/status                 std_msgs/String
 ```
 
-为兼容地修复 RGB、depth、检测错帧，新增：
+同一 RGB、depth、annotated 消息使用同一个 `header.stamp`。`detections_stamped` 载荷示例：
 
-```text
-/vision/detections_stamped  std_msgs/String
+```json
 {
   "frame_seq": 123,
   "capture_timestamp_ns": 123456789,
-  "detections": [ ... ]
+  "detections": []
 }
 ```
 
-vision node 为同一帧的 `image_raw`、`depth_image` 和 `annotated` 写入相同的 `Image.header.stamp`。grasp brain 只在两个图像和 `detections_stamped` 的 `capture_timestamp_ns` 完全匹配时才交给规划器；旧 `/vision/detections` 保留给既有订阅者。
+grasp brain 只有在 RGB、depth 与 stamped detections 时间戳完全匹配时才组装快照。`camera_info` 使用 reliable + transient-local，并周期重发，避免晚加入订阅者错过内参。
 
-`/vision/camera_info` 使用 reliable + transient-local QoS，并在启动后每五秒重发，因此 grasp brain 晚启动不会再因错过一次性内参消息而在机械臂 HOME/开夹爪后失败。
-
-## 生命周期和语音
-
-grasp brain 在拥有机器人前先等待 CameraInfo、手眼文件和可选 GraspNet 依赖。机械臂创建后，正常、异常与 Ctrl-C 路径均由 worker `finally` 调用有限时的 `safe_shutdown()`；主线程请求退出后会 join worker，避免 daemon 线程在回零途中被解释器直接丢弃。
-
-`use_voice:=false` 会同时传给 `panthera_voice` 的 `voice_enabled` 和 grasp brain。此时 brain 不发布 listen request、不等待语音命令，headless 环境会安全退出，TTY 环境仅接受终端输入。
-
-## 构建
+## 构建（仅源码/接口检查）
 
 ```bash
 source /opt/ros/humble/setup.bash
 source /home/ubuntu/miniconda3/etc/profile.d/conda.sh
 conda activate pathera_grasp
-
 cd /home/ubuntu/A_shen_arm/pathera_grasp/ros2_ws
+
 colcon build --symlink-install \
   --packages-select panthera_voice panthera_vision panthera_stream \
   panthera_grasp_brain grasp_bringup
+
 source install/setup.bash
 bash patch_shebangs.sh
 ```
 
-TASK-003 已在不接硬件的前提下完成上述五个包的构建。构建输出中的 `setuptools/easy_install` 弃用警告来自系统 ROS 打包链，不阻断构建。
+目标机 `/usr/bin/python3` 与 ROS Humble `rclpy` ABI/项目视觉依赖并不一致。每次 `colcon build` 后都要运行 `patch_shebangs.sh`；脚本会先验证 Conda Python 3.10 能导入 ROS 与视觉依赖，再修改生成入口。
 
-`bash patch_shebangs.sh` 不是可选步骤：本机 `/usr/bin/python3` 是 3.12，ROS Humble `rclpy` 使用 3.10 ABI。脚本会验证 `pathera_grasp` 环境确实是 Python 3.10，并可同时导入 `rclpy`、RealSense、OpenCV、Torch 和 Ultralytics，然后修正每个生成入口。每次重新构建后都要再次执行。
-
-## 启动边界
-
-理论启动命令：
+可以只解析 launch 参数而不启动节点：
 
 ```bash
-ros2 launch grasp_bringup grasp_system.launch.py \
-  stream_port:=8080 \
-  voice_prompt_duration:=3.5 \
-  use_voice:=false \
-  use_npu:=false \
-  use_graspnet:=false
+ros2 launch grasp_bringup grasp_system.launch.py --show-args
 ```
 
-已使用 `ros2 launch grasp_bringup grasp_system.launch.py --show-args` 成功加载该 launch 文件；这只验证参数解析，不会启动节点或硬件。真实节点联调仍须取得真机授权并按阶段执行。
+不要执行完整 launch 进行实机测试，除非已另行完成 FULL_LOAD 放置接口升级并获得现场授权。
 
-即使环境就绪，首次真机运行前仍必须确认：
+## 离线回归
 
-- `hand_eye_calibration.json` 对应当前相机、TCP、基座和末端工具；当前项目标定时间为 `2026-08-31 07:18:17`。
-- CAN/串口权限、急停、HOME/PUT/ZERO 轨迹和工作空间均由现场负责人检查。
-- 只运行一个机械臂拥有者：单体或 ROS2 grasp brain 二选一。
-- NPU、相机、声卡和机械臂硬件测试均另行授权。
+```bash
+cd /home/ubuntu/A_shen_arm/pathera_grasp
+source /opt/ros/humble/setup.bash
+source /home/ubuntu/miniconda3/etc/profile.d/conda.sh
+conda activate pathera_grasp
+PYTHONDONTWRITEBYTECODE=1 python -m unittest discover -s tests -p 'test_ros_transport.py'
+```
 
-## 已知范围
+覆盖：帧时间戳不串帧、CameraInfo durable QoS、`use_voice` 参数一致性、Python 解释器修补脚本和 worker 可终止性。
 
-ROS 通讯已具备 durable CameraInfo、带时间戳的帧关联、`use_voice` 一致性和可 join 的抓取 worker。它不等于已经完成真机验收：没有运行实际相机、机械臂、NPU 或声卡，也没有经验证的环境/自碰撞规划。
+## 恢复开发待办
+
+- 定义 ROS2 侧 `FULL_LOAD`、`PLACING` 与显式放置请求的消息或 service/action。
+- 保证放置意图只由 robot-owning worker 串行消费。
+- 为持物状态下取消、SIGINT、节点异常和反馈丢失定义载物处置策略。
+- 同步单进程网页的互斥状态机、安全校验和瓶子/盒子 fail-closed profile。
+- 增加 fake-robot 测试，验证抓取成功后不会直接进入统一 shutdown。
+- 完成后再进行 camera-only、fake-robot、低速真机三级验收。

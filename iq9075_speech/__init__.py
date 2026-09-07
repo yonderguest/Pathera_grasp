@@ -10,8 +10,8 @@
     text = asr.transcribe_pcm16(pcm_bytes, sr)   # 输入 PCM16 字节流
     asr.close()
 
-后端：默认优先 SenseVoice QNN（HTP/NPU 推理，模型经 AI Hub 云端编译）；
-可选 sherpa-onnx + SenseVoice（离线 ONNX，CPU）作为回退。
+后端：默认使用 sherpa-onnx + SenseVoice（离线 ONNX，CPU），便于跨机器恢复；
+可通过配置显式启用 SenseVoice QNN，或用 auto 在 QNN context 存在时优先 NPU。
 """
 from .recognizer import SpeechRecognizer
 from .config import AsrConfig

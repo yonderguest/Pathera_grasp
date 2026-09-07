@@ -1288,6 +1288,49 @@ class PlannerSafetyTests(unittest.TestCase):
         self.assertEqual(moves, ["PUT2", "PUT1", "PUT2", "READY HOME"])
         self.assertEqual(opens, [True])
 
+    def test_full_load_return_uses_this_grasp_trajectory_then_live_home_feedback(self):
+        class Robot:
+            @staticmethod
+            def gripper_state():
+                return 0.20, 0.60
+
+        config = GraspConfig()
+        planner = GraspPlanner(Robot(), config, threading.Event())
+        approach = [np.full(6, 0.11), np.full(6, 0.22)]
+        found = {"tool_target": np.array([0.31, 0.02, 0.13])}
+        retreat_calls = []
+        moves = []
+        planner.execute_retry_retreat = lambda trajectory, target: retreat_calls.append(
+            (trajectory, target)
+        )
+        planner.move_j = lambda joints, duration, label, **_kwargs: moves.append(
+            (np.asarray(joints, dtype=float).copy(), duration, label)
+        )
+        planner.wait_until_stationary = lambda: config.home.copy()
+
+        actual = planner.return_home_with_full_load(approach, found)
+
+        self.assertTrue(np.allclose(actual, config.home))
+        self.assertEqual(len(retreat_calls), 1)
+        self.assertIs(retreat_calls[0][0], approach)
+        self.assertIs(retreat_calls[0][1], found)
+        self.assertEqual([label for _, _, label in moves], ["FULL LOAD HOME"])
+        self.assertFalse(any("PUT" in label for _, _, label in moves))
+
+    def test_full_load_place_requires_live_home_feedback(self):
+        config = GraspConfig()
+        planner = GraspPlanner(NoopRobot(), config, threading.Event())
+        placed = []
+        planner.finish_place_sequence = lambda: placed.append(True) or True
+        planner.wait_until_stationary = lambda: config.home.copy()
+
+        self.assertTrue(planner.place_full_load_from_home())
+        self.assertEqual(placed, [True])
+
+        planner.wait_until_stationary = lambda: config.home + 0.20
+        with self.assertRaisesRegex(RuntimeError, "outside HOME tolerance"):
+            planner.place_full_load_from_home()
+
     def test_stop_during_put1_still_releases_before_skipping_ready_home(self):
         interrupted = threading.Event()
         planner = GraspPlanner(NoopRobot(), GraspConfig(), interrupted)
@@ -1314,6 +1357,7 @@ class PlannerSafetyTests(unittest.TestCase):
         planner = GraspPlanner(NoopRobot(), config, threading.Event())
         found = {"scan_joint_position": np.zeros(6)}
         selected = iter(["red", False])
+        returned_full_load = []
         finished = []
 
         class Streamer:
@@ -1326,6 +1370,12 @@ class PlannerSafetyTests(unittest.TestCase):
 
             def clear_selected_target(self, message):
                 self.cleared.append(message)
+
+            def set_full_load_ready(self, message):
+                self.full_load_message = message
+
+            def finish_place_command(self, message):
+                self.place_message = message
 
             def set_control_message(self, _message):
                 pass
@@ -1345,7 +1395,10 @@ class PlannerSafetyTests(unittest.TestCase):
             0.3,
             config.grasp_min_force,
         )
-        planner.finish_place_sequence = lambda: finished.append(True) or True
+        planner.return_home_with_full_load = lambda *_args: (
+            returned_full_load.append(True) or np.zeros(6)
+        )
+        planner.place_full_load_from_home = lambda: finished.append(True) or True
 
         result = planner.run_grasp_loop(
             None,
@@ -1353,12 +1406,16 @@ class PlannerSafetyTests(unittest.TestCase):
             None,
             streamer,
             lambda: next(selected),
+            lambda: True,
         )
 
         self.assertFalse(result)
+        self.assertEqual(returned_full_load, [True])
         self.assertEqual(finished, [True])
         self.assertEqual(streamer.selected, ["red"])
         self.assertEqual(len(streamer.cleared), 1)
+        self.assertIn("放置", streamer.full_load_message)
+        self.assertIn("放置完成", streamer.place_message)
 
     def test_exhausted_pregrasp_retry_returns_home_before_next_target(self):
         config = GraspConfig()

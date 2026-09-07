@@ -45,6 +45,8 @@ class ControlMode(str, Enum):
     FOLLOW_ARMING = "follow_arming"
     FOLLOWING = "following"
     RETURNING = "returning"
+    FULL_LOAD = "full_load"
+    PLACING = "placing"
     STOPPING = "stopping"
 
 
@@ -62,7 +64,7 @@ button,select,input{font:inherit}.shell{width:min(1500px,100%);margin:auto;paddi
 .card{background:linear-gradient(155deg,#102433eb,#091721f4);border:1px solid var(--line);border-radius:18px;box-shadow:var(--shadow);overflow:hidden;backdrop-filter:blur(16px)}.vision-stage{display:grid;grid-template-columns:72px minmax(0,1fr) 72px;grid-template-areas:"left videos right";gap:14px;align-items:center}.video-grid{grid-area:videos;display:grid;grid-template-columns:1fr 1fr;gap:14px}.video-head{display:flex;align-items:center;justify-content:space-between;padding:11px 15px;border-bottom:1px solid var(--line)}.video h2{margin:0;font-size:15px;font-weight:650}.video small{color:var(--muted)}.video img{display:block;width:100%;aspect-ratio:4/3;object-fit:contain;background:#02070b}
 .jog-button{height:108px;padding:0 5px;border:1px solid #2b6671;border-radius:16px;background:linear-gradient(160deg,#123747,#0c2230);color:#c9fffa;font-size:38px;box-shadow:0 15px 35px #0006;cursor:pointer;transition:.18s transform,.18s border-color,.18s background}.jog-button:first-of-type{grid-area:left}.jog-button:last-of-type{grid-area:right}.jog-button:hover:not(:disabled){transform:translateY(-2px);border-color:var(--cyan);background:#124453}.jog-button span{display:block;margin-top:-4px;font-size:10px;font-weight:650;color:#9ddbd7}
 .control-grid{display:grid;grid-template-columns:minmax(0,2fr) minmax(290px,1fr);gap:14px;margin-top:14px}.panel{padding:17px}.panel-title{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:13px}.panel h2{margin:0;font-size:16px}.panel p{margin:4px 0 0;color:var(--muted);font-size:12px;line-height:1.6}.target-row{display:grid;grid-template-columns:190px minmax(180px,1fr) auto;gap:10px}.mode-actions{display:grid;grid-template-columns:1fr;gap:10px}.system-actions{display:flex;gap:10px;margin-top:12px;justify-content:flex-end}
-select,input,button.action{min-height:46px;border-radius:11px;border:1px solid #315064;padding:0 13px}select,input{min-width:0;color:var(--text);background:#07151f;outline:none}select:focus,input:focus,button:focus-visible{border-color:var(--cyan);box-shadow:0 0 0 3px #35d0c529;outline:none}button.action{color:white;border:0;font-weight:700;cursor:pointer;transition:.18s transform,.18s filter}button.action:hover:not(:disabled){transform:translateY(-1px);filter:brightness(1.08)}button:disabled{opacity:.38;cursor:not-allowed;transform:none!important}#send-target{background:linear-gradient(135deg,var(--cyan2),#2473c4)}#follow-mode{background:linear-gradient(135deg,#6758dd,var(--violet))}#follow-mode[aria-pressed="true"]{background:linear-gradient(135deg,#137f79,var(--cyan))}#stop-program{background:linear-gradient(135deg,#b93449,var(--red))}
+select,input,button.action{min-height:46px;border-radius:11px;border:1px solid #315064;padding:0 13px}select,input{min-width:0;color:var(--text);background:#07151f;outline:none}select:focus,input:focus,button:focus-visible{border-color:var(--cyan);box-shadow:0 0 0 3px #35d0c529;outline:none}button.action{color:white;border:0;font-weight:700;cursor:pointer;transition:.18s transform,.18s filter}button.action:hover:not(:disabled){transform:translateY(-1px);filter:brightness(1.08)}button:disabled{opacity:.38;cursor:not-allowed;transform:none!important}#send-target{background:linear-gradient(135deg,var(--cyan2),#2473c4)}#follow-mode{background:linear-gradient(135deg,#6758dd,var(--violet))}#follow-mode[aria-pressed="true"]{background:linear-gradient(135deg,#137f79,var(--cyan))}#place-object{background:linear-gradient(135deg,#ca812f,var(--amber))}#stop-program{background:linear-gradient(135deg,#b93449,var(--red))}
 .feedback{display:grid;grid-template-columns:auto 1fr;gap:10px 12px;align-items:center;margin-top:14px;padding:13px 14px;border:1px solid #203d4e;border-radius:13px;background:#06131d}.feedback-label{color:var(--muted);font-size:12px}.feedback-value{color:#cfe9ed;font-size:13px;overflow-wrap:anywhere}.auth-note{display:none;margin-top:10px;color:#ffd59a;font-size:12px}.auth-note.visible{display:block}.hand-state{color:var(--muted);font-size:12px}
 @media(max-width:980px){.vision-stage{grid-template-columns:1fr 1fr;grid-template-areas:"videos videos" "left right"}.jog-button{height:62px}.jog-button span{display:inline;margin:0 0 0 8px;font-size:11px}.control-grid{grid-template-columns:1fr}.target-row{grid-template-columns:180px 1fr auto}}
 @media(max-width:720px){.shell{padding:10px}header{align-items:flex-start;flex-direction:column}.status-cluster{justify-content:flex-start}.video-grid{grid-template-columns:1fr}.target-row{grid-template-columns:1fr}.system-actions{flex-direction:column}.system-actions button{width:100%}.feedback{grid-template-columns:1fr}.panel{padding:14px}}
@@ -83,23 +85,24 @@ select,input,button.action{min-height:46px;border-radius:11px;border:1px solid #
 <select id="target-preset" aria-label="目标预设"><option value="红色积木">红色积木</option><option value="黄色积木">黄色积木</option><option value="绿色积木">绿色积木</option><option value="蓝色积木">蓝色积木</option><option value="瓶子">瓶子</option><option value="盒子">盒子</option><option value="任意颜色积木">任意颜色积木</option></select>
 <input id="target-text" maxlength="64" autocomplete="off" placeholder="输入：抓绿色积木 / 瓶子 / 盒子"><button id="send-target" class="action" type="button">开始抓取</button></div>
 <div id="auth-note" class="auth-note visible">正在建立本机控制会话…</div></section>
-<section class="card panel"><div class="panel-title"><div><h2>运行模式</h2><p>随动采用停—看—最多 20 mm 闭环步进；停止随动后返回 HOME。</p></div><span id="hand-state" class="hand-state">手部：未启用</span></div><div class="mode-actions"><button id="follow-mode" class="action" type="button" aria-pressed="false">随动模式</button></div><div class="system-actions"><button id="stop-program" class="action" type="button">结束程序并回启动姿态</button></div></section>
+<section class="card panel"><div class="panel-title"><div><h2>运行模式</h2><p>随动采用停—看—最多 20 mm 闭环步进；持物待放时仅允许放置。</p></div><span id="hand-state" class="hand-state">手部：未启用</span></div><div class="mode-actions"><button id="follow-mode" class="action" type="button" aria-pressed="false">随动模式</button><button id="place-object" class="action" type="button">放置</button></div><div class="system-actions"><button id="stop-program" class="action" type="button">结束程序并回启动姿态</button></div></section>
 </section>
 <section class="feedback" aria-live="polite"><span class="feedback-label">控制状态</span><span id="control-status" class="feedback-value">正在连接程序状态…</span></section>
 </main>
 <script>
-const statusNode=document.getElementById("control-status"),modePill=document.getElementById("mode-pill"),handState=document.getElementById("hand-state"),authNote=document.getElementById("auth-note"),sendButton=document.getElementById("send-target"),followButton=document.getElementById("follow-mode"),stopButton=document.getElementById("stop-program"),targetText=document.getElementById("target-text"),jogButtons=[document.getElementById("jog-left"),document.getElementById("jog-right")],previewKind=document.getElementById("preview-kind"),previewImage=document.getElementById("preview-image");
+const statusNode=document.getElementById("control-status"),modePill=document.getElementById("mode-pill"),handState=document.getElementById("hand-state"),authNote=document.getElementById("auth-note"),sendButton=document.getElementById("send-target"),followButton=document.getElementById("follow-mode"),placeButton=document.getElementById("place-object"),stopButton=document.getElementById("stop-program"),targetText=document.getElementById("target-text"),jogButtons=[document.getElementById("jog-left"),document.getElementById("jog-right")],previewKind=document.getElementById("preview-kind"),previewImage=document.getElementById("preview-image");
 let lastStatus=null,authValid=false;
-const modeNames={idle:"抓取待机",grasping:"抓取中",jogging:"J1 手动",follow_arming:"随动准备",following:"随动中",returning:"返回 HOME",stopping:"安全结束"};
+const modeNames={idle:"抓取待机",grasping:"抓取中",jogging:"J1 手动",follow_arming:"随动准备",following:"随动中",returning:"返回 HOME",full_load:"持物待放",placing:"正在放置",stopping:"安全结束"};
 function showAuthError(message){authValid=false;authNote.textContent=message;authNote.classList.add("visible");if(lastStatus)renderStatus(lastStatus)}
 async function controlFetch(path,payload){const r=await fetch(path,{method:"POST",credentials:"same-origin",headers:{"Content-Type":"application/json"},body:JSON.stringify(payload)});let d={};try{d=await r.json()}catch(_){throw new Error(`控制接口返回异常（HTTP ${r.status}）`)}if(!r.ok){if(r.status===403)showAuthError("控制 Cookie 已过期，请刷新当前页面建立新的本机控制会话。");throw new Error(d.message||`请求失败（HTTP ${r.status}）`)}return d}
-function renderStatus(d){lastStatus=d;const mode=d.mode||"idle",followActive=!!d.follow_active,canStopFollow=mode==="follow_arming"||mode==="following";modePill.dataset.mode=mode;modePill.textContent=`模式 · ${modeNames[mode]||mode}`;statusNode.textContent=d.message||"等待目标";sendButton.disabled=!authValid||!d.accepting_targets||d.pending||d.stop_requested;jogButtons.forEach(b=>b.disabled=!authValid||!d.accepting_jog||d.pending||d.stop_requested);followButton.disabled=!authValid||d.stop_requested||d.pending||(followActive?!canStopFollow:!d.accepting_follow);followButton.setAttribute("aria-pressed",followActive?"true":"false");followButton.textContent=mode==="returning"?"正在返回 HOME":(followActive?"结束随动":"随动模式");stopButton.disabled=!authValid||!!d.stop_requested;if(followActive){const confidence=Number(d.follow_hand_confidence||0),age=d.follow_last_seen_age_s;handState.textContent=d.follow_hand_visible?`手部：已锁定 ${(confidence*100).toFixed(0)}%`:(age==null?"手部：等待检测":`手部：丢失 ${Number(age).toFixed(1)} s`)}else{handState.textContent="手部：未启用"}}
+function renderStatus(d){lastStatus=d;const mode=d.mode||"idle",followActive=!!d.follow_active,canStopFollow=mode==="follow_arming"||mode==="following";modePill.dataset.mode=mode;modePill.textContent=`模式 · ${modeNames[mode]||mode}`;statusNode.textContent=d.message||"等待目标";sendButton.disabled=!authValid||!d.accepting_targets||d.pending||d.stop_requested;jogButtons.forEach(b=>b.disabled=!authValid||!d.accepting_jog||d.pending||d.stop_requested);followButton.disabled=!authValid||d.stop_requested||d.pending||(followActive?!canStopFollow:!d.accepting_follow);followButton.setAttribute("aria-pressed",followActive?"true":"false");followButton.textContent=mode==="returning"?"正在返回 HOME":(followActive?"结束随动":"随动模式");placeButton.disabled=!authValid||!d.accepting_place||d.pending||d.stop_requested;stopButton.disabled=!authValid||!!d.stop_requested;if(followActive){const confidence=Number(d.follow_hand_confidence||0),age=d.follow_last_seen_age_s;handState.textContent=d.follow_hand_visible?`手部：已锁定 ${(confidence*100).toFixed(0)}%`:(age==null?"手部：等待检测":`手部：丢失 ${Number(age).toFixed(1)} s`)}else{handState.textContent=mode==="full_load"?"夹爪：持物待放":"手部：未启用"}}
 async function verifyAuth(){try{await controlFetch("/api/auth",{});authValid=true;authNote.classList.remove("visible");if(lastStatus)renderStatus(lastStatus)}catch(e){showAuthError("控制 Cookie 无效，请刷新当前页面后重试。");statusNode.textContent=e.message}}
 async function refreshStatus(){try{const r=await fetch("/api/status",{cache:"no-store"}),d=await r.json();renderStatus(d)}catch(_){statusNode.textContent="控制状态连接失败"}}
 sendButton.addEventListener("click",async()=>{const command=targetText.value.trim()||document.getElementById("target-preset").value;if(!confirm(`确认开始抓取“${command}”？请确保机械臂路径内无人、无障碍物。`))return;try{sendButton.disabled=true;const d=await controlFetch("/api/target",{command,confirmed:true});statusNode.textContent=d.message}catch(e){statusNode.textContent=e.message}finally{refreshStatus()}});
 targetText.addEventListener("keydown",e=>{if(e.key==="Enter"&&!sendButton.disabled)sendButton.click()});
 jogButtons.forEach(button=>button.addEventListener("click",async()=>{const direction=button.id==="jog-left"?"left":"right";try{jogButtons.forEach(b=>b.disabled=true);const d=await controlFetch("/api/joint1",{direction});statusNode.textContent=d.message}catch(e){statusNode.textContent=e.message}finally{refreshStatus()}}));
 followButton.addEventListener("click",async()=>{const enabled=!(lastStatus&&lastStatus.follow_active);if(enabled&&!confirm("确认启动随动模式？机械臂将从 HOME 开始，以停—看—最多 20 mm 的闭环步进低速跟随唯一手部。"))return;try{followButton.disabled=true;const d=await controlFetch("/api/follow",{enabled,confirmed:true});statusNode.textContent=d.message}catch(e){statusNode.textContent=e.message}finally{refreshStatus()}});
+placeButton.addEventListener("click",async()=>{if(!confirm("确认放置？机械臂将保持夹爪闭合经过 PUT2 到 PUT1，在 PUT1 松开后经 PUT2 返回 HOME。"))return;try{placeButton.disabled=true;const d=await controlFetch("/api/place",{confirmed:true});statusNode.textContent=d.message}catch(e){statusNode.textContent=e.message}finally{refreshStatus()}});
 stopButton.addEventListener("click",async()=>{if(!confirm("确认安全结束程序？机械臂将返回程序接管前的启动姿态，再停止电机。此按钮不是急停。"))return;try{stopButton.disabled=true;const d=await controlFetch("/api/stop",{confirmed:true});statusNode.textContent=d.message}catch(e){statusNode.textContent=e.message}finally{refreshStatus()}});
 refreshStatus();verifyAuth();setInterval(refreshStatus,500);
 previewKind.addEventListener("change",()=>{previewImage.src=`/stream/${previewKind.value}?t=${Date.now()}`});
@@ -248,6 +251,7 @@ class VisionStreamer:
         self._pending_target_command: str | None = None
         self._pending_joint1_jog: str | None = None
         self._pending_follow_command: bool | None = None
+        self._pending_place_command = False
         self._joint1_jog_active = False
         self._accepting_targets = False
         self._stop_requested = False
@@ -351,6 +355,8 @@ class VisionStreamer:
             if self._control_mode not in {
                 ControlMode.FOLLOW_ARMING,
                 ControlMode.FOLLOWING,
+                ControlMode.FULL_LOAD,
+                ControlMode.PLACING,
                 ControlMode.STOPPING,
             }:
                 self._control_mode = ControlMode.IDLE
@@ -437,6 +443,63 @@ class VisionStreamer:
             if self._control_mode is ControlMode.JOGGING:
                 self._control_mode = ControlMode.IDLE
             if not self._stop_requested:
+                self._control_message = str(message)
+            self._condition.notify_all()
+
+    def set_full_load_ready(self, message: str) -> None:
+        """Expose the main-thread-confirmed HOME-with-payload state.
+
+        This state intentionally records no fixed TCP/object position.  The
+        planner has already returned using the object-specific grasp trajectory;
+        the page only gates the next intent until it is placed.
+        """
+        with self._condition:
+            if self._stop_requested:
+                return
+            self._pending_target_command = None
+            self._pending_joint1_jog = None
+            self._pending_follow_command = None
+            self._pending_place_command = False
+            self._accepting_targets = False
+            self._active_command_id = None
+            self._control_mode = ControlMode.FULL_LOAD
+            self._control_message = str(message)
+            self._condition.notify_all()
+
+    def submit_place_command(self) -> int:
+        """Queue one explicit placement request from the verified FULL_LOAD state."""
+        with self._condition:
+            if self._closed:
+                raise RuntimeError("推流服务已经关闭")
+            if self._stop_requested:
+                raise RuntimeError("程序正在安全结束，不能开始放置")
+            if self._control_mode is not ControlMode.FULL_LOAD:
+                raise RuntimeError("机械臂当前未处于持物待放状态，不能放置")
+            if self._pending_place_command:
+                raise RuntimeError("已有放置请求等待主程序处理，请勿重复提交")
+            self._pending_place_command = True
+            self._control_mode = ControlMode.PLACING
+            self._command_sequence += 1
+            self._active_command_id = self._command_sequence
+            self._control_message = "放置请求已提交；主程序将从当前 HOME 姿态执行 PUT2→PUT1。"
+            self._condition.notify_all()
+            return self._command_sequence
+
+    def poll_place_command(self) -> bool:
+        """Consume the placement intent in the robot-owning main thread."""
+        with self._condition:
+            command = self._pending_place_command
+            self._pending_place_command = False
+            return bool(command)
+
+    def finish_place_command(self, message: str) -> None:
+        """Return to normal target selection only after release and HOME."""
+        with self._condition:
+            self._pending_place_command = False
+            self._active_command_id = None
+            if not self._stop_requested:
+                self._control_mode = ControlMode.IDLE
+                self._accepting_targets = True
                 self._control_message = str(message)
             self._condition.notify_all()
 
@@ -557,6 +620,7 @@ class VisionStreamer:
             self._pending_target_command = None
             self._pending_joint1_jog = None
             self._pending_follow_command = None
+            self._pending_place_command = False
             self._joint1_jog_active = False
             self._control_mode = ControlMode.STOPPING
             self._active_command_id = None
@@ -581,6 +645,7 @@ class VisionStreamer:
                 self._pending_target_command is not None
                 or self._pending_joint1_jog is not None
                 or self._pending_follow_command is not None
+                or self._pending_place_command
             )
             idle = self._control_mode is ControlMode.IDLE
             now = time.monotonic()
@@ -605,6 +670,11 @@ class VisionStreamer:
                 "accepting_follow": (
                     self._accepting_targets
                     and idle
+                    and not self._stop_requested
+                    and not pending
+                ),
+                "accepting_place": (
+                    self._control_mode is ControlMode.FULL_LOAD
                     and not self._stop_requested
                     and not pending
                 ),
@@ -917,6 +987,7 @@ class _VisionStreamHandler(BaseHTTPRequestHandler):
             "/api/stop",
             "/api/joint1",
             "/api/follow",
+            "/api/place",
         ):
             self._send_json(404, {"message": "接口不存在"})
             return
@@ -979,6 +1050,18 @@ class _VisionStreamHandler(BaseHTTPRequestHandler):
                 self._send_json(
                     202,
                     {"message": message, "request_id": request_id},
+                )
+                return
+            if path == "/api/place":
+                if payload.get("confirmed") is not True:
+                    raise ValueError("必须确认放置流程")
+                request_id = self.streamer.submit_place_command()
+                self._send_json(
+                    202,
+                    {
+                        "message": "放置请求已提交；机械臂将保持夹爪闭合经 PUT2 到 PUT1。",
+                        "request_id": request_id,
+                    },
                 )
                 return
             if path == "/api/joint1":

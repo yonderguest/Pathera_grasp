@@ -1420,12 +1420,14 @@ class GraspPlanner:
         cfg = self.config
 
         # PUT2 is the validated transfer pose on both sides of the PUT1 drop
-        # pose.  Enter PUT2 while clamped, continue to PUT1 and release there,
-        # then leave through PUT2 with the gripper open before returning HOME.
+        # pose. The caller has already confirmed that the arm is at HOME with
+        # a payload clamped. Enter PUT2 while clamped, continue to PUT1 and
+        # release there, then leave through PUT2 with the gripper open before
+        # returning HOME.
         # If a stop arrives while carrying the object, still reach PUT1 and
         # release so the object is never stranded in the gripper at shutdown.
         print(
-            f"[PUT2] moving grasp -> PUT2 while holding: "
+            f"[PUT2] moving FULL_LOAD HOME -> PUT2 while holding: "
             f"{np.round(cfg.put2, 3)}"
         )
         self.move_j(cfg.put2, cfg.put2_duration, "PUT2")
@@ -1451,6 +1453,61 @@ class GraspPlanner:
         print("[READY] moving PUT2 -> HOME with gripper open ...")
         self.move_j(cfg.home, cfg.return_home_duration, "READY HOME")
         return True
+
+    def return_home_with_full_load(self, approach_trajectory, found):
+        """Return a confirmed grasp to HOME without visiting either PUT pose.
+
+        The first leg is rebuilt from the current feedback and this grasp's
+        own validated approach trajectory.  No fixed TCP/object position is
+        used: different object sizes, grasp centres and wrist attitudes all
+        keep their object-specific retreat geometry.
+        """
+        cfg = self.config
+        if self.interrupted.is_set():
+            return None
+        print("[FULL_LOAD] retreating along this grasp's verified approach path ...")
+        self.execute_retry_retreat(approach_trajectory, found)
+        if self.interrupted.is_set():
+            return None
+        print("[FULL_LOAD] moving pre-grasp -> HOME while keeping the gripper closed ...")
+        self.move_j(cfg.home, cfg.return_home_duration, "FULL LOAD HOME")
+        actual = self.wait_until_stationary()
+        if actual is None:
+            raise RuntimeError("FULL_LOAD HOME did not become stationary")
+        actual = np.asarray(actual, dtype=float)
+        if actual.shape != (6,) or not np.all(np.isfinite(actual)):
+            raise RuntimeError("FULL_LOAD HOME returned invalid joint feedback")
+        error = float(np.max(np.abs(actual - np.asarray(cfg.home, dtype=float))))
+        if error > cfg.zero_position_tolerance:
+            raise RuntimeError(
+                f"FULL_LOAD HOME feedback is outside tolerance: {error:.3f} rad"
+            )
+        with self.sdk_call():
+            gripper_position, gripper_torque = self.robot.gripper_state()
+        gripper_position = float(gripper_position)
+        gripper_torque = float(gripper_torque)
+        if not np.isfinite(gripper_position) or not np.isfinite(gripper_torque):
+            raise RuntimeError("FULL_LOAD HOME returned invalid gripper feedback")
+        print(
+            "[FULL_LOAD] HOME confirmed with gripper still commanded closed: "
+            f"position={gripper_position:+.3f}, torque={gripper_torque:+.3f}"
+        )
+        return actual
+
+    def place_full_load_from_home(self):
+        """Run the deferred PUT2 -> PUT1 -> release sequence from live HOME."""
+        current = self.wait_until_stationary()
+        if current is None:
+            raise RuntimeError("FULL_LOAD placement requires a stationary HOME pose")
+        current = np.asarray(current, dtype=float)
+        if current.shape != (6,) or not np.all(np.isfinite(current)):
+            raise RuntimeError("FULL_LOAD placement has invalid HOME joint feedback")
+        error = float(np.max(np.abs(current - np.asarray(self.config.home, dtype=float))))
+        if error > self.config.zero_position_tolerance:
+            raise RuntimeError(
+                f"FULL_LOAD placement rejected outside HOME tolerance: {error:.3f} rad"
+            )
+        return self.finish_place_sequence()
 
     def execute_grasp(self, final, approach_trajectory, streamer=None):
         clamped, _gpos, _gtor = self.grasp_and_close(
@@ -2689,6 +2746,7 @@ class GraspPlanner:
         tcp_camera,
         streamer,
         select_target,
+        wait_for_place=None,
     ):
         """Run the interactive visual grasp loop with force-based retries."""
         cfg = self.config
@@ -2960,8 +3018,8 @@ class GraspPlanner:
                     f"(threshold={cfg.grasp_min_force:.3f})"
                 )
                 if force_magnitude >= cfg.grasp_min_force:
-                    if not self.finish_place_sequence():
-                        raise RuntimeError("place sequence did not complete")
+                    if self.return_home_with_full_load(approach_trajectory, found) is None:
+                        return False
                     task_complete = True
                     break
 
@@ -2997,19 +3055,32 @@ class GraspPlanner:
             if task_complete:
                 if self.interrupted.is_set():
                     return False
-                print(
-                    "[READY] placement completed; HOME is ready for the next "
-                    "target selection."
-                )
-                self._say("抓取完成，请选择下一个目标")
+                print("[FULL_LOAD] object is held at HOME; waiting for an explicit place request.")
                 if streamer is not None:
+                    mark_full_load = getattr(streamer, "set_full_load_ready", None)
+                    message = "抓取成功，机械臂已带物返回 HOME；夹爪保持闭合，请点击“放置”。"
+                    if callable(mark_full_load):
+                        mark_full_load(message)
+                    else:
+                        streamer.set_control_message(message)
+                if wait_for_place is None or not wait_for_place():
+                    return False
+                if self.interrupted.is_set():
+                    return False
+                if not self.place_full_load_from_home():
+                    raise RuntimeError("deferred place sequence did not complete")
+                print("[READY] placement completed; HOME is ready for the next target selection.")
+                self._say("物体已放置，请选择下一个目标")
+                if streamer is not None:
+                    finish_place = getattr(streamer, "finish_place_command", None)
+                    message = "放置完成，机械臂已回到 HOME，请选择下一个目标。"
+                    if callable(finish_place):
+                        finish_place(message)
                     clear_target = getattr(streamer, "clear_selected_target", None)
                     if callable(clear_target):
-                        clear_target("抓取完成，机械臂已回到 HOME，请选择下一个目标。")
+                        clear_target(message)
                     else:
-                        streamer.set_control_message(
-                            "抓取完成，机械臂已回到 HOME，请选择下一个目标。"
-                        )
+                        streamer.set_control_message(message)
                 continue
         return False
 

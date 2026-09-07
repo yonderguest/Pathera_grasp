@@ -1,6 +1,6 @@
 #!/bin/bash
 # 下载 sherpa-onnx 中文离线 TTS 模型 vits-melo-tts-zh_en（中英混读，163MB）。
-# 默认放到 /home/ubuntu/work/sherpa_tts_models/vits-melo-tts-zh_en，
+# 默认放到 <项目根>/models/sherpa_tts/vits-melo-tts-zh_en，
 # 与 SherpaTtsConfig 默认 model_dir 保持一致（也可用环境变量覆盖）。
 set -euo pipefail
 

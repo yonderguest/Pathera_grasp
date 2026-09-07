@@ -93,6 +93,7 @@ class StreamerUiTests(unittest.TestCase):
         self.assertIn("/api/stop", _INDEX_HTML)
         self.assertIn("/api/joint1", _INDEX_HTML)
         self.assertIn("/api/follow", _INDEX_HTML)
+        self.assertIn("/api/place", _INDEX_HTML)
         self.assertIn("/api/auth", _INDEX_HTML)
         self.assertIn('idle:"抓取待机"', _INDEX_HTML)
         self.assertIn("authValid", _INDEX_HTML)
@@ -117,6 +118,35 @@ class StreamerUiTests(unittest.TestCase):
         self.assertNotIn("safety-confirm", _INDEX_HTML)
         self.assertNotIn("已确认机械臂路径内无人、无障碍物", _INDEX_HTML)
         self.assertIn("confirmed:true", _INDEX_HTML)
+        self.assertIn("place-object", _INDEX_HTML)
+
+    def test_full_load_only_accepts_one_explicit_place_request(self):
+        streamer = VisionStreamer()
+        streamer.set_accepting_targets(True)
+        streamer.set_full_load_ready("payload is held at HOME")
+
+        status = streamer.control_status()
+        self.assertEqual(status["mode"], ControlMode.FULL_LOAD.value)
+        self.assertTrue(status["accepting_place"])
+        self.assertFalse(status["accepting_targets"])
+        self.assertFalse(status["accepting_jog"])
+        self.assertFalse(status["accepting_follow"])
+        with self.assertRaises(RuntimeError):
+            streamer.submit_target_command("green block")
+        with self.assertRaises(RuntimeError):
+            streamer.submit_joint1_jog("left")
+        with self.assertRaises(RuntimeError):
+            streamer.submit_follow_command(True)
+
+        request_id = streamer.submit_place_command()
+        self.assertGreater(request_id, 0)
+        self.assertEqual(streamer.control_status()["mode"], ControlMode.PLACING.value)
+        with self.assertRaises(RuntimeError):
+            streamer.submit_place_command()
+        self.assertTrue(streamer.poll_place_command())
+        streamer.finish_place_command("placement complete")
+        self.assertEqual(streamer.control_status()["mode"], ControlMode.IDLE.value)
+        self.assertTrue(streamer.control_status()["accepting_targets"])
 
     def test_joint1_jog_queue_is_idle_gated_and_serialized(self):
         streamer = VisionStreamer()
@@ -340,6 +370,27 @@ class StreamerUiTests(unittest.TestCase):
             self.assertIn("request_id", payload)
             self.assertIs(streamer.poll_follow_command(), True)
             self.assertEqual(streamer.control_status()["mode"], "follow_arming")
+        finally:
+            streamer.stop()
+
+    def test_http_place_only_queues_from_full_load(self):
+        streamer = VisionStreamer(
+            host="127.0.0.1",
+            port=0,
+            control_token="test-control-token",
+        )
+        streamer.set_accepting_targets(True)
+        streamer.set_full_load_ready("payload is held at HOME")
+        self.assertTrue(streamer.start())
+        try:
+            status, payload, _ = self._post(
+                streamer,
+                "/api/place",
+                {"confirmed": True},
+            )
+            self.assertEqual(status, 202)
+            self.assertIn("request_id", payload)
+            self.assertTrue(streamer.poll_place_command())
         finally:
             streamer.stop()
 

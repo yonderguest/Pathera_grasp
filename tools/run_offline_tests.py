@@ -28,6 +28,9 @@ if __name__ == "__main__":
     python_roots = (
         PROJECT_ROOT / "grasp_demo.py",
         PROJECT_ROOT / "voice_controller.py",
+        PROJECT_ROOT / "iq9075_speech",
+        PROJECT_ROOT / "iq9075_tts",
+        PROJECT_ROOT / "voice_demo",
         PROJECT_ROOT / "tools",
         PROJECT_ROOT / "tests",
         SDK_SCRIPTS / "Panthera_lib",

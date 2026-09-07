@@ -4,7 +4,8 @@
 
 Workflow:
     select object/colour -> scan J1 -> detect -> pre-grasp -> re-detect
-    -> final grasp -> place -> HOME, or HOME -> CPU hand follow -> HOME.
+    -> final grasp -> FULL_LOAD at HOME -> explicit web placement -> HOME,
+    or HOME -> explicitly enabled CPU hand follow -> HOME.
 """
 
 import os
@@ -367,6 +368,24 @@ def read_terminal_command(
     return None
 
 
+def wait_for_place_command(streamer) -> bool:
+    """Wait for the only allowed web action while a payload is held at HOME.
+
+    The HTTP thread merely queues the request.  This loop runs in the main
+    robot-owning thread and does not issue any motion itself.
+    """
+    if streamer is None:
+        raise RuntimeError("FULL_LOAD requires the web placement controller")
+    poll_place = getattr(streamer, "poll_place_command", None)
+    if not callable(poll_place):
+        raise RuntimeError("web placement controller is unavailable")
+    while not shutdown_requested.is_set() and not streamer.is_closed:
+        if poll_place():
+            return True
+        time.sleep(0.2)
+    return False
+
+
 def choose_target_at_start(
     voice=None,
     streamer=None,
@@ -631,6 +650,7 @@ def main():
                 planner.jog_joint1,
                 hand_follow_runner,
             ),
+            lambda: wait_for_place_command(streamer),
         )
     except Exception as exc:
         safe_print(f"[MAIN] exception: {exc!r}")
