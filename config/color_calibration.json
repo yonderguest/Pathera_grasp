@@ -1,0 +1,61 @@
+{
+  "version": 1,
+  "created_utc": "2026-08-31T09:23:28.634709+00:00",
+  "colors": [
+    "red",
+    "yellow",
+    "green",
+    "blue"
+  ],
+  "feature": "OpenCV Lab median; white-background balanced; weighted Lab distance",
+  "classes": {
+    "red": {
+      "center_lab": [
+        58.0,
+        162.0,
+        153.0
+      ],
+      "sample_count": 30,
+      "sample_distance_median": 5.6569,
+      "sample_distance_p95": 7.8748,
+      "nearest_center_distance": 60.9028,
+      "max_distance": 16.1746
+    },
+    "yellow": {
+      "center_lab": [
+        154.0,
+        125.0,
+        192.0
+      ],
+      "sample_count": 30,
+      "sample_distance_median": 1.4736,
+      "sample_distance_p95": 14.112,
+      "nearest_center_distance": 33.1112,
+      "max_distance": 14.9
+    },
+    "green": {
+      "center_lab": [
+        107.0,
+        107.0,
+        171.0
+      ],
+      "sample_count": 30,
+      "sample_distance_median": 2.0976,
+      "sample_distance_p95": 15.2608,
+      "nearest_center_distance": 33.1112,
+      "max_distance": 14.9
+    },
+    "blue": {
+      "center_lab": [
+        65.0,
+        125.0,
+        104.0
+      ],
+      "sample_count": 30,
+      "sample_distance_median": 1.9708,
+      "sample_distance_p95": 4.0187,
+      "nearest_center_distance": 61.4601,
+      "max_distance": 10.0
+    }
+  }
+}

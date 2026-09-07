@@ -5,7 +5,7 @@ import yaml
 import numpy as np
 import pinocchio as pin
 from scipy.spatial.transform import Rotation as R
-from scipy.interpolate import CubicSpline
+from scipy.interpolate import CubicSpline, PchipInterpolator
 
 _SDK_ROOT = os.path.normpath(os.path.join(os.path.dirname(__file__), "..", ".."))
 if _SDK_ROOT not in sys.path:
@@ -252,6 +252,14 @@ class Panthera(htr.Robot):  # 继承自htr.Robot
             state.append(motor_state)
         return state
 
+    def refresh_motor_state(self, settle_time=0.02):
+        """主动刷新电机反馈，避免稳定判定读取运动过程中的缓存值。"""
+        self.send_get_motor_state_cmd()
+        self.motor_send_cmd()
+        if settle_time > 0.0:
+            time.sleep(float(settle_time))
+        return self.get_current_state()
+
     def get_current_pos(self):
         """获取当前关节角度，返回np.ndarray"""
         joint_angles = np.zeros(self.motor_count)
@@ -473,6 +481,23 @@ class Panthera(htr.Robot):  # 继承自htr.Robot
 
         # 获取当前位置
         current_pos = self.get_current_pos()
+
+        # 以配置限速为硬约束。若调用者给出的 duration 太短，自动延长，
+        # 不能把超速值直接交给不做限幅的 Joint_Pos_Vel。
+        if self.velocity_limits is not None:
+            velocity_limits = np.asarray(self.velocity_limits, dtype=float)
+            if np.any(velocity_limits <= 0.0):
+                raise ValueError("关节速度限幅必须全部大于0")
+            required_duration = float(
+                np.max(np.abs(pos - current_pos) / velocity_limits)
+            )
+            if required_duration > duration:
+                print(
+                    f"MoveJ duration {duration:.3f}s 低于限速所需 "
+                    f"{required_duration:.3f}s，已自动延长"
+                )
+                duration = required_duration
+                timeout = max(float(timeout), duration + 2.0)
 
         # 计算速度: v = (目标位置 - 当前位置) / 时间
         # 这样可以确保所有关节在duration时间内同时到达目标位置
@@ -729,7 +754,7 @@ class Panthera(htr.Robot):  # 继承自htr.Robot
         参数:
             target_position: 目标位置 [x, y, z] (m)
             target_rotation: 目标旋转矩阵 3x3，如果为None则只考虑位置
-            init_q: 初始关节角度，如果为None则使用当前角度（multi_init=False时有效）
+            init_q: 首选初始关节角度；multi_init=True 时也会作为第一次尝试
             max_iter: 最大迭代次数
             eps: 收敛阈值（位置误差范数）
             damping: 阻尼系数 λ，用于避免雅可比矩阵奇异性
@@ -747,10 +772,11 @@ class Panthera(htr.Robot):  # 继承自htr.Robot
             自适应阻尼会根据误差大小动态调整阻尼系数
 
             当multi_init=True时，会尝试多个不同的初始关节配置：
+            - 调用者传入的 init_q（若有效）
             - 当前位置
             - 零位
             - 关节限位中点
-            - 随机配置（在关节限位范围内）
+            - 固定随机种子生成的配置（在关节限位范围内）
             返回第一个成功求解的结果，或最佳结果
         """
         if self.model is None:
@@ -760,7 +786,7 @@ class Panthera(htr.Robot):  # 继承自htr.Robot
         # 如果启用多初始值尝试
         if multi_init:
             return self._inverse_kinematics_dls_multi_init_impl(
-                target_position, target_rotation, num_attempts,
+                target_position, target_rotation, init_q, num_attempts,
                 max_iter, eps, damping, adaptive_damping
             )
 
@@ -885,37 +911,49 @@ class Panthera(htr.Robot):  # 继承自htr.Robot
         return None
 
     def _inverse_kinematics_dls_multi_init_impl(self, target_position, target_rotation,
-                                                num_attempts, max_iter, eps, damping, adaptive_damping):
+                                                init_q, num_attempts, max_iter, eps,
+                                                damping, adaptive_damping):
         """
         阻尼最小二乘法逆运动学求解的多初始值实现（内部函数）
         """
-        # 准备多个初始值
+        # 准备可复现的多个初始值。调用者 seed 必须排在第一位，不能被
+        # multi_init 分支静默丢弃。
         init_configs = []
 
-        # 1. 当前位置
-        init_configs.append(self.get_current_pos())
+        def append_unique(candidate):
+            candidate = np.asarray(candidate, dtype=float)
+            if candidate.shape != (self.motor_count,) or not np.all(np.isfinite(candidate)):
+                return
+            if not any(np.allclose(candidate, existing) for existing in init_configs):
+                init_configs.append(candidate.copy())
 
-        # 2. 零位
-        init_configs.append(np.zeros(self.motor_count))
+        if init_q is not None:
+            append_unique(init_q)
 
-        # 3. 中间位置（关节限位的中点）
+        # 当前位置仍是重要回退，但不再覆盖调用者 seed。
+        try:
+            append_unique(self.get_current_pos())
+        except Exception as exc:
+            print(f"读取当前关节角失败，跳过当前位姿 IK seed: {exc!r}")
+
+        append_unique(np.zeros(self.motor_count))
+
+        # 中间位置（关节限位的中点）
         if self.joint_limits is not None:
             mid_config = (self.joint_limits['lower'] + self.joint_limits['upper']) / 2
-            init_configs.append(mid_config)
+            append_unique(mid_config)
 
-        # 4. 随机配置（在关节限位范围内）
+        # 使用固定种子的补充配置，保证同一输入下求解顺序可复现。
+        rng = np.random.default_rng(0)
+        remaining = max(0, num_attempts - len(init_configs))
         if self.joint_limits is not None:
             lower = self.joint_limits['lower']
             upper = self.joint_limits['upper']
-
-            for _ in range(num_attempts - 3):
-                random_config = np.random.uniform(lower, upper)
-                init_configs.append(random_config)
+            for _ in range(remaining):
+                append_unique(rng.uniform(lower, upper))
         else:
-            # 如果没有限位信息，使用随机小角度
-            for _ in range(num_attempts - 3):
-                random_config = np.random.uniform(-np.pi/4, np.pi/4, self.motor_count)
-                init_configs.append(random_config)
+            for _ in range(remaining):
+                append_unique(rng.uniform(-np.pi/4, np.pi/4, self.motor_count))
 
         # 尝试每个初始值
         best_result = None
@@ -1322,6 +1360,36 @@ class Panthera(htr.Robot):  # 继承自htr.Robot
 
         return success
 
+    def _send_mit_position_command(self, position, velocity, max_tqu=None):
+        """Send one gravity-compensated MIT command with the trajectory gains."""
+        if max_tqu is None:
+            if hasattr(self, 'max_torque'):
+                max_tqu = self.max_torque
+            else:
+                max_tqu = np.array([21.0, 36.0, 36.0, 21.0, 10.0, 10.0])
+        kp = [30.0, 50.0, 60.0, 25.0, 15.0, 10.0]
+        kd = [3.0, 5.0, 6.0, 2.5, 1.5, 1.0]
+        tqe = np.asarray(self.get_Gravity(position))
+        tqe = np.clip(tqe, -np.asarray(max_tqu), np.asarray(max_tqu))
+        return self.pos_vel_tqe_kp_kd(
+            pos=position,
+            vel=velocity,
+            tqe=tqe,
+            kp=kp,
+            kd=kd,
+        )
+
+    def hold_joints_mit_once(self, joints, max_torque):
+        """Refresh a stationary pose without leaving the active MIT mode."""
+        joints = np.asarray(joints, dtype=float)
+        if joints.shape != (self.motor_count,) or not np.all(np.isfinite(joints)):
+            raise RuntimeError("MIT hold target is invalid")
+        return self._send_mit_position_command(
+            joints.tolist(),
+            [0.0] * self.motor_count,
+            max_torque,
+        )
+
     def _execute_trajectory(self, joint_trajectory, timestamps, velocities, max_tqu=None):
         """
         执行轨迹（使用 MIT 模式 + 重力补偿）
@@ -1333,10 +1401,15 @@ class Panthera(htr.Robot):  # 继承自htr.Robot
             else:
                 max_tqu = np.array([21.0, 36.0, 36.0, 21.0, 10.0, 10.0])
 
-        kp = [30.0, 50.0, 60.0, 25.0, 15.0, 10.0]
-        kd = [3.0, 5.0, 6.0, 2.5, 1.5, 1.0]
-
         start_time = time.perf_counter()
+        max_dispatch_lateness = 0.0
+        max_command_time = 0.0
+        late_dispatches = 0
+        nominal_period = (
+            float(np.median(np.diff(np.asarray(timestamps, dtype=float))))
+            if len(timestamps) > 1
+            else 0.0
+        )
 
         for i in range(len(joint_trajectory)):
             loop_start = time.perf_counter()
@@ -1348,6 +1421,13 @@ class Panthera(htr.Robot):  # 继承自htr.Robot
             while (time.perf_counter() - start_time) < target_time:
                 time.sleep(0.0001)
 
+            dispatch_lateness = max(
+                0.0, time.perf_counter() - start_time - target_time
+            )
+            max_dispatch_lateness = max(max_dispatch_lateness, dispatch_lateness)
+            if dispatch_lateness > max(0.005, 0.5 * nominal_period):
+                late_dispatches += 1
+
             # # 使用 Joint_Pos_Vel 模式发送控制指令
             # success = self.Joint_Pos_Vel(
             #     pos=joint_trajectory[i],
@@ -1356,29 +1436,30 @@ class Panthera(htr.Robot):  # 继承自htr.Robot
             #     iswait=False
             # )
 
-            # 使用 MIT 模式发送控制指令
-            tqe = np.asarray(self.get_Gravity(joint_trajectory[i]))
-            tqe = np.clip(tqe, -np.asarray(max_tqu), np.asarray(max_tqu))
-            success = self.pos_vel_tqe_kp_kd(
-                pos=joint_trajectory[i],
-                vel=velocities[i],
-                tqe=tqe,
-                kp=kp,
-                kd=kd
+            # 使用与静止保持相同的 MIT 模式，避免轨迹末端切换控制器。
+            success = self._send_mit_position_command(
+                joint_trajectory[i],
+                velocities[i],
+                max_tqu,
             )
 
             if not success:
                 print(f"  ✗ 控制失败于点 {i+1}/{len(joint_trajectory)}")
                 return False
 
-            # 监控时序
-            actual_time = time.perf_counter() - start_time
-            time_error = actual_time - target_time
-            if time_error > 0.005:  # 超过 5ms
-                print(f"  ⚠ 时序延迟: {time_error*1000:.1f}ms")
+            max_command_time = max(
+                max_command_time, time.perf_counter() - loop_start
+            )
 
         total_time = time.perf_counter() - start_time
         print(f"  ✓ 实际执行时间: {total_time:.3f}s")
+        if late_dispatches:
+            print(
+                "  ⚠ 控制时序汇总: "
+                f"late={late_dispatches}/{len(joint_trajectory)}, "
+                f"max_dispatch={max_dispatch_lateness * 1000.0:.1f}ms, "
+                f"max_command={max_command_time * 1000.0:.1f}ms"
+            )
 
         return True
     
@@ -1653,18 +1734,119 @@ class Panthera(htr.Robot):  # 继承自htr.Robot
         state = gripper_motor.get_current_motor_state()
         return float(state.position), float(state.torque)
 
-    def move_j_checked(self, joints, duration, max_torque, label="moveJ", wait=True):
+    def move_j_checked(
+        self,
+        joints,
+        duration,
+        max_torque,
+        label="moveJ",
+        wait=True,
+        timeout=15.0,
+        tolerance=0.05,
+    ):
         """发送 moveJ 并在被拒绝时抛出异常。"""
         result = self.moveJ(
             joints,
             duration=duration,
             max_tqu=max_torque,
             iswait=wait,
-            tolerance=0.05,
+            tolerance=float(tolerance),
+            timeout=float(timeout),
         )
         if result is False:
             reason = "rejected or timed out" if wait else "rejected"
             raise RuntimeError(f"{label} move {reason}")
+        return True
+
+    def execute_joint_trajectory_checked(
+        self,
+        joint_trajectory,
+        duration,
+        max_torque,
+        label="Cartesian approach",
+        control_period=0.02,
+    ):
+        """Execute a prevalidated path with dense shape-preserving commands.
+
+        ``compute_cartesian_path`` returns points at Cartesian ``eef_step``
+        spacing, not at a motor-control rate.  Sending those sparse points
+        directly leaves hundreds of milliseconds between MIT commands and can
+        look like a sudden drop.  PCHIP stays inside each joint segment's data
+        range, while smooth time scaling gives zero endpoint velocity without
+        the overshoot risk of a free cubic spline.
+        """
+        trajectory = np.asarray(joint_trajectory, dtype=float)
+        if (
+            trajectory.ndim != 2
+            or trajectory.shape[0] < 2
+            or trajectory.shape[1] != self.motor_count
+            or not np.all(np.isfinite(trajectory))
+        ):
+            raise RuntimeError(f"{label} trajectory is invalid")
+        duration = float(duration)
+        if duration <= 0.0:
+            raise RuntimeError(f"{label} duration must be positive")
+
+        lower = np.asarray(self.joint_limits["lower"], dtype=float)
+        upper = np.asarray(self.joint_limits["upper"], dtype=float)
+        if np.any(trajectory < lower) or np.any(trajectory > upper):
+            raise RuntimeError(f"{label} trajectory exceeds joint limits")
+
+        control_period = float(control_period)
+        if not 0.010 <= control_period <= 0.050:
+            raise RuntimeError(f"{label} control period is outside 10..50 ms")
+
+        sparse_count = trajectory.shape[0]
+        knot_progress = np.linspace(0.0, 1.0, sparse_count)
+        control_count = max(sparse_count, int(np.ceil(duration / control_period)) + 1)
+        timestamps_array = np.linspace(0.0, duration, control_count)
+        normalized_time = timestamps_array / duration
+        path_progress = normalized_time * normalized_time * (3.0 - 2.0 * normalized_time)
+        progress_rate = (
+            6.0 * normalized_time * (1.0 - normalized_time) / duration
+        )
+        interpolator = PchipInterpolator(knot_progress, trajectory, axis=0)
+        control_trajectory = np.asarray(interpolator(path_progress), dtype=float)
+        control_velocities = np.asarray(
+            interpolator.derivative()(path_progress), dtype=float
+        ) * progress_rate[:, None]
+        # Preserve the exact validated boundary states despite floating-point
+        # interpolation and enter/leave the path with a stationary command.
+        control_trajectory[0] = trajectory[0]
+        control_trajectory[-1] = trajectory[-1]
+        control_velocities[0] = 0.0
+        control_velocities[-1] = 0.0
+
+        if (
+            not np.all(np.isfinite(control_trajectory))
+            or not np.all(np.isfinite(control_velocities))
+            or np.any(control_trajectory < lower)
+            or np.any(control_trajectory > upper)
+        ):
+            raise RuntimeError(f"{label} resampled trajectory is invalid")
+
+        actual_dt = duration / (control_count - 1)
+        velocity_limits = np.asarray(self.velocity_limits, dtype=float)
+        if np.any(np.abs(control_velocities) > velocity_limits + 1e-6):
+            raise RuntimeError(f"{label} trajectory exceeds velocity limits")
+        if control_velocities.shape[0] > 1:
+            acceleration = np.diff(control_velocities, axis=0) / actual_dt
+            acceleration_limits = np.asarray(self.acceleration_limits, dtype=float)
+            if np.any(np.abs(acceleration) > acceleration_limits + 1e-6):
+                raise RuntimeError(f"{label} trajectory exceeds acceleration limits")
+
+        print(
+            f"[{label}] control resample: {sparse_count} planned -> "
+            f"{control_count} commands ({1.0 / actual_dt:.1f} Hz)",
+            flush=True,
+        )
+        if not self._execute_trajectory(
+            control_trajectory.tolist(),
+            timestamps_array.tolist(),
+            control_velocities.tolist(),
+            max_torque,
+        ):
+            raise RuntimeError(f"{label} execution failed")
         return True
 
     def hold_joints(self, joints, duration, max_torque):

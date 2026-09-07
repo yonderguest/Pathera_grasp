@@ -1,0 +1,2 @@
+edge-tts>=6.0
+sherpa-onnx>=1.10
