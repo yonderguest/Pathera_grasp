@@ -69,6 +69,20 @@
 | 语音 ASR/TTS | 保留、默认关闭 | SenseVoice + sherpa-onnx VITS；当前不属于正式抓取主线 |
 | GraspNet | 可选实验后端 | 默认关闭，仅用于离线候选评估或明确设置 `GRASPNET_USE=1` 的实验 |
 | ROS2 | 暂停使用 | 代码保留供未来跨进程/跨机器部署；当前不得与单进程入口同时启动 |
+| MuJoCo | WSL2/PC 离线仿真 | 独立入口、独立环境，不导入或启动真机硬件；支持 RGB-D、IK、三色分拣、Viewer、网页和录像 |
+
+### 1.1 MuJoCo 离线仿真（可选）
+
+仓库包含一套与真机入口隔离的 MuJoCo 回归环境。仿真入口为 `run_mujoco.py`，用于在 WSL2/PC 上验证机械臂模型、虚拟 D405 RGB-D、目标识别、Pinocchio IK、抓取与三色 PUT1 分拣；它不会初始化 RealSense、QNN、CAN、Panthera SDK、ROS2 或语音硬件。
+
+```bash
+export MUJOCO_GL=egl
+export PYTHONNOUSERSITE=1
+export PYTHONPATH=$PWD
+python run_mujoco.py --mode sort --detector colour --scene-seed 20260904
+```
+
+当前自动三色分拣是仿真专用的确定性集成回归，不等同于真机的“单目标抓取 → FULL_LOAD → 人工放置”状态机，也不是已经完成系统辨识的毫米级数字孪生。环境、命令和真实性边界见 [MuJoCo 模块说明](sim/README.md) 与 [完整教程](docs/mujoco_guide.md)。
 
 ## 2. 系统工作流
 
@@ -164,6 +178,8 @@ HOME + 夹爪张开
 | 路径 | 作用 | 详细说明 |
 |---|---|---|
 | `grasp_demo.py` | 正式单进程入口 | 本文 |
+| `run_mujoco.py` | WSL2/PC 专用 MuJoCo 入口 | [MuJoCo 模块说明](sim/README.md) |
+| `sim/` | 仿真模型、RGB-D、识别、IK、网页与回归测试 | [MuJoCo 模块说明](sim/README.md) |
 | `Panthera-HT_SDK/panthera_python/scripts/Panthera_lib/` | 机器人、视觉、规划、NPU、随动核心库 | [核心库说明](Panthera-HT_SDK/panthera_python/scripts/Panthera_lib/README.md) |
 | `config/` | 识别 profile 与颜色标定 | [配置说明](config/README.md) |
 | `tools/` | 离线回归、相机/NPU诊断、网页夹具 | [工具说明](tools/README.md) |
@@ -183,6 +199,7 @@ HOME + 夹爪张开
 - `voice_controller.py`：主程序使用的语音门面，语音不可用时回退到终端/网页。
 - `VOICE_SETUP.md`：语音环境的历史安装与验证记录。
 - `requirements_asr.txt`、`requirements_tts.txt`：语音增量依赖，不是整个项目的锁定环境。
+- `requirements-sim.txt`：仅供 Linux x86_64 MuJoCo 独立环境使用，不得安装到 IQ9075/AArch64 真机环境。
 
 ## 4. 运行环境
 
@@ -319,7 +336,7 @@ cd /home/ubuntu/A_shen_arm/pathera_grasp
 PYTHONDONTWRITEBYTECODE=1 python tools/run_offline_tests.py
 ```
 
-它会在内存中编译以下自研代码：主程序、语音门面、ASR/TTS 包、语音示例、工具、测试、`Panthera_lib` 项目核心以及 ROS2 源码，然后运行 `tests/` 下全部单元测试。第三方仓库和厂商生成/依赖目录不纳入本项目静态编译。
+它会在内存中编译以下自研代码：主程序、MuJoCo 入口与 `sim/`、语音门面、ASR/TTS 包、语音示例、工具、测试、`Panthera_lib` 项目核心以及 ROS2 源码，然后运行 `tests/` 下全部真机主线单元测试。MuJoCo 动态测试使用独立环境执行 `python -m unittest discover -s sim/tests -v`；第三方仓库和厂商生成/依赖目录不纳入本项目静态编译。
 
 针对性命令：
 

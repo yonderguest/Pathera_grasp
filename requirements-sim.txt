@@ -1,0 +1,10 @@
+# Pinocchio must be installed separately from conda-forge, never from PyPI.
+mujoco==3.11.0
+numpy==2.2.6
+# --camera-view 使用 OpenCV HighGUI；不要与 opencv-python-headless 同时安装。
+opencv-python==5.0.0.93
+ultralytics==8.4.115
+
+# Approved Aliyun CPU-only CPython 3.10 / Linux x86_64 wheels.
+torch @ https://mirrors.aliyun.com/pytorch-wheels/cpu/torch-2.4.1%2Bcpu-cp310-cp310-linux_x86_64.whl
+torchvision @ https://mirrors.aliyun.com/pytorch-wheels/cpu/torchvision-0.19.1%2Bcpu-cp310-cp310-linux_x86_64.whl

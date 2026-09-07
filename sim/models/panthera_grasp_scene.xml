@@ -1,0 +1,179 @@
+<mujoco model="pathera_grasp_mujoco">
+  <!-- 仅仿真模型：不包含 CAN、RealSense、NPU 或任何真机插件。 -->
+  <compiler angle="radian" autolimits="true"/>
+  <option timestep="0.002" gravity="0 0 -9.81" integrator="implicitfast"/>
+  <default>
+    <joint damping="0.8" armature="0.01"/>
+    <geom friction="0.9 0.02 0.001" condim="3"/>
+    <position kp="100" forcelimited="true"/>
+  </default>
+
+  <asset>
+    <!-- 视觉网格源自 Panthera-HT_description；碰撞仍使用下方的轻量代理。 -->
+    <mesh name="panthera_base_mesh" file="../../Panthera-HT_SDK/panthera_python/Panthera-HT_description/meshes/base_link.STL"/>
+    <mesh name="panthera_link1_mesh" file="../../Panthera-HT_SDK/panthera_python/Panthera-HT_description/meshes/link1.STL"/>
+    <mesh name="panthera_link2_mesh" file="../assets/panthera_ht_stl/link2_visual.STL"/>
+    <mesh name="panthera_link3_mesh" file="../../Panthera-HT_SDK/panthera_python/Panthera-HT_description/meshes/link3.STL"/>
+    <mesh name="panthera_link4_mesh" file="../../Panthera-HT_SDK/panthera_python/Panthera-HT_description/meshes/link4.STL"/>
+    <mesh name="panthera_link5_mesh" file="../../Panthera-HT_SDK/panthera_python/Panthera-HT_description/meshes/link5.STL"/>
+    <mesh name="panthera_link6_mesh" file="../../Panthera-HT_SDK/panthera_python/Panthera-HT_description/meshes/link6.STL"/>
+    <!-- Official RealSense ROS D405 mesh; source and Apache-2.0 notice are adjacent. -->
+    <mesh name="realsense_d405_mesh" file="../assets/realsense_d405/d405.stl" scale="0.001 0.001 0.001"/>
+    <material name="mat_panthera" rgba="0.24 0.28 0.33 1" specular="0.45" shininess="0.55"/>
+    <material name="mat_realsense" rgba="0.10 0.12 0.14 1" specular="0.55" shininess="0.70"/>
+    <material name="mat_table" rgba="0.32 0.23 0.15 1"/>
+    <material name="mat_block_red" rgba="0.82 0.08 0.08 1"/>
+    <material name="mat_block_green" rgba="0.10 0.72 0.20 1"/>
+    <material name="mat_block_blue" rgba="0.08 0.22 0.85 1"/>
+    <material name="mat_put1" rgba="0.92 0.70 0.10 0.70"/>
+    <material name="mat_gripper_metal" rgba="0.12 0.14 0.17 1" specular="0.60" shininess="0.75"/>
+    <material name="mat_gripper_accent" rgba="0.36 0.42 0.48 1" specular="0.50" shininess="0.65"/>
+    <material name="mat_gripper_pad" rgba="0.055 0.060 0.065 1" specular="0.08" shininess="0.10"/>
+  </asset>
+
+  <worldbody>
+    <light name="key" directional="true" pos="0 -1 2" dir="0.1 0.4 -1" diffuse="0.9 0.9 0.9"/>
+    <light name="fill" directional="true" pos="-1 1 1.5" dir="0.5 -0.4 -1" diffuse="0.35 0.35 0.35"/>
+    <geom name="floor" type="plane" pos="0 0 -0.50" size="2 2 0.1" rgba="0.16 0.16 0.18 1"/>
+
+    <!-- 实测时只需在 scene_calibration.yaml 同步更新桌面和放置区。 -->
+    <body name="work_table" pos="0.12 0 0.0">
+      <geom name="table_top" type="box" pos="0 0 -0.04" size="0.42 0.36 0.04" material="mat_table"/>
+      <geom name="table_leg_left" type="box" pos="-0.33 -0.27 -0.29" size="0.035 0.035 0.21" material="mat_table"/>
+      <geom name="table_leg_right" type="box" pos="0.33 0.27 -0.29" size="0.035 0.035 0.21" material="mat_table"/>
+    </body>
+
+    <!-- MuJoCo world coordinates are the same Base frame used by the planner/URDF. -->
+    <body name="base_link" pos="0 0 0">
+      <inertial pos="0.00005789 -0.00015938 0.02298649" mass="0.62922454" fullinertia="0.00061305 0.00063876 0.0007565 -0.00000132 0.00000169 -0.00000021"/>
+      <geom name="base_visual_mesh" group="1" type="mesh" mesh="panthera_base_mesh" contype="0" conaffinity="0" material="mat_panthera"/>
+      <geom name="base_collision" group="1" contype="2" conaffinity="1" type="cylinder" fromto="0 0 0 0 0 0.0584" size="0.045" rgba="0.35 0.35 0.40 0"/>
+      <body name="link1" pos="0 0 0.0584">
+        <inertial pos="0.00278873 -0.00094387 0.02491842" mass="0.28101551" fullinertia="0.00039386 0.0002136 0.00037066 0.00000375 -0.00003733 0.00000717"/>
+        <joint name="joint1" type="hinge" axis="0 0 1" range="-2.4 2.4"/>
+        <geom name="link1_visual_mesh" group="1" type="mesh" mesh="panthera_link1_mesh" contype="0" conaffinity="0" material="mat_panthera"/>
+        <geom name="link1_collision" group="1" contype="2" conaffinity="1" type="capsule" fromto="0 0 0 0.018199 0 0.053" size="0.025" rgba="0.85 0.30 0.20 0"/>
+        <body name="link2" pos="0.018199 0 0.053">
+          <inertial pos="-0.12936212 -0.00213339 0.00007183" mass="1.5165092" fullinertia="0.00044711 0.02261049 0.02272105 0.00003071 -0.00005119 0.00000301"/>
+          <joint name="joint2" type="hinge" axis="0 1 0" range="0 3.2"/>
+          <geom name="link2_visual_mesh" group="1" type="mesh" mesh="panthera_link2_mesh" contype="0" conaffinity="0" material="mat_panthera"/>
+          <geom name="link2_collision" group="1" contype="2" conaffinity="1" type="capsule" fromto="0 0 0 -0.26 0 0" size="0.025" rgba="0.85 0.55 0.20 0"/>
+          <body name="link3" pos="-0.26 0 0">
+            <inertial pos="0.16343103 -0.00164646 0.05337427" mass="0.66917784" fullinertia="0.00061339 0.00538615 0.00532976 -0.00001439 -0.00070321 -0.00001404"/>
+            <joint name="joint3" type="hinge" axis="0 -1 0" range="0 4.0"/>
+            <geom name="link3_visual_mesh" group="1" type="mesh" mesh="panthera_link3_mesh" contype="0" conaffinity="0" material="mat_panthera"/>
+            <geom name="link3_collision" group="1" contype="2" conaffinity="1" type="capsule" fromto="0 0 0 0.23 0 0.06" size="0.022" rgba="0.85 0.70 0.25 0"/>
+            <body name="link4" pos="0.23 0 0.06">
+              <inertial pos="0.05240131 -0.00055249 0.04094177" mass="0.30780516" fullinertia="0.00025787 0.00039454 0.00035094 -0.00001011 -0.00017337 -0.00000809"/>
+              <joint name="joint4" type="hinge" axis="0 -1 0" range="-1.6 1.6"/>
+              <geom name="link4_visual_mesh" group="1" type="mesh" mesh="panthera_link4_mesh" contype="0" conaffinity="0" material="mat_panthera"/>
+              <geom name="link4_collision" group="1" contype="2" conaffinity="1" type="capsule" fromto="0 0 0 0.07 0 0.036319" size="0.020" rgba="0.35 0.80 0.35 0"/>
+              <body name="link5" pos="0.07 0 0.036319">
+                <inertial pos="0.00303007 0.00008509 -0.03624079" mass="0.23711139" fullinertia="0.00004815 0.00005773 0.00003359 -0.00000003 -0.00000015 -0.00000001"/>
+                <joint name="joint5" type="hinge" axis="0 0 -1" range="-1.7 1.7"/>
+                <geom name="link5_visual_mesh" group="1" type="mesh" mesh="panthera_link5_mesh" contype="0" conaffinity="0" material="mat_panthera"/>
+                <geom name="link5_collision" group="1" contype="2" conaffinity="1" type="capsule" fromto="0 0 0 0.02345 0 -0.039" size="0.018" rgba="0.30 0.60 0.90 0"/>
+                <body name="link6" pos="0.02345 0 -0.039">
+                  <inertial pos="0.06704625 0.00051731 0.00001674" mass="0.30" fullinertia="0.00107368 0.00068998 0.00167551 -0.0000125 0.0000003 0.00002517"/>
+                  <joint name="joint6" type="hinge" axis="1 0 0" range="-2.5 2.5"/>
+                  <geom name="link6_visual_mesh" group="1" type="mesh" mesh="panthera_link6_mesh" contype="0" conaffinity="0" material="mat_panthera"/>
+                  <!-- group=1 is a coarse self-collision proxy, hidden from the virtual wrist camera. -->
+                  <!-- Conservative wrist proxy stops 55 mm before the calibrated TCP. -->
+                  <geom name="link6_collision" group="1" contype="2" conaffinity="1" type="capsule" fromto="0 0 0 0.110 0 0" size="0.018" rgba="0.60 0.40 0.85 0"/>
+                  <body name="tool_link" pos="0.165 0 0">
+                    <!-- Planner TCP: exactly joint6 + [0.165, 0, 0], matching grasp_config.py. -->
+                    <site name="tcp" group="1" type="sphere" pos="0 0 0" size="0.006" rgba="1 0 0 1"/>
+                    <!-- The calibrated planner TCP is also the simplified grasp centre. -->
+                    <site name="grasp_site" group="1" type="sphere" pos="0 0 0" size="0.004" rgba="1 1 0 1"/>
+                    <!-- T_tcp_camera 使用已存手眼标定；四元数另含 OpenCV 光学帧到 MuJoCo 相机帧的 y/z 翻转。 -->
+                  <body name="d405_visual_mount" pos="-0.08539455 0.01009073 0.06531856" quat="0.59041566 0.39719526 -0.40185391 -0.57633212">
+                      <!-- Official URDF visual transform: front glass origin between the two IR axes. -->
+                      <geom name="d405_visual_mesh" group="1" type="mesh" mesh="realsense_d405_mesh" pos="0.0038 -0.009 0" euler="1.57079632679 0 1.57079632679" contype="0" conaffinity="0" material="mat_realsense"/>
+                    <camera name="wrist_rgbd" pos="0 0 0" fovy="55"/>
+                  </body>
+                    <body name="gripper_base" pos="0 0 0">
+                      <!-- CAD-free visual parallel-jaw proxy.  The hidden box
+                           pads retain the established contact dimensions. -->
+                      <geom name="gripper_mount_plate" group="1" type="cylinder" pos="-0.098 0 0" euler="0 1.57079632679 0" size="0.027 0.020" material="mat_gripper_metal" contype="0" conaffinity="0"/>
+                      <geom name="gripper_crosshead" group="1" type="box" pos="-0.075 0 0" size="0.010 0.052 0.022" material="mat_gripper_metal" contype="0" conaffinity="0"/>
+                      <geom name="gripper_guide_left" group="1" type="capsule" fromto="-0.076 0.037 0.016 -0.018 0.037 0.016" size="0.005" material="mat_gripper_accent" contype="0" conaffinity="0"/>
+                      <geom name="gripper_guide_right" group="1" type="capsule" fromto="-0.076 -0.037 0.016 -0.018 -0.037 0.016" size="0.005" material="mat_gripper_accent" contype="0" conaffinity="0"/>
+                      <geom name="gripper_guide_left_lower" group="1" type="capsule" fromto="-0.076 0.037 -0.016 -0.018 0.037 -0.016" size="0.005" material="mat_gripper_accent" contype="0" conaffinity="0"/>
+                      <geom name="gripper_guide_right_lower" group="1" type="capsule" fromto="-0.076 -0.037 -0.016 -0.018 -0.037 -0.016" size="0.005" material="mat_gripper_accent" contype="0" conaffinity="0"/>
+                      <body name="left_finger" pos="0 0 0">
+                        <joint name="gripper_left" type="slide" axis="0 1 0" range="0 0.040"/>
+                        <geom name="left_finger_visual_rail" group="1" type="capsule" fromto="-0.073 0 0 -0.014 0 0" size="0.0075" material="mat_gripper_metal" contype="0" conaffinity="0"/>
+                        <geom name="left_finger_visual_knuckle" group="1" type="cylinder" pos="-0.058 0 0" euler="1.57079632679 0 0" size="0.014 0.009" material="mat_gripper_accent" contype="0" conaffinity="0"/>
+                        <geom name="left_finger_visual_pad" group="1" type="box" pos="-0.013 0 -0.002" size="0.010 0.0035 0.016" material="mat_gripper_pad" contype="0" conaffinity="0"/>
+                        <geom name="left_finger_visual_tip" group="1" type="capsule" fromto="-0.007 0 -0.016 -0.007 0 0.012" size="0.0045" material="mat_gripper_pad" contype="0" conaffinity="0"/>
+                        <geom name="left_finger_collision" group="2" contype="2" conaffinity="1" type="box" pos="-0.035 0 0" size="0.035 0.006 0.012" rgba="0 0 0 0"/>
+                      </body>
+                      <body name="right_finger" pos="0 0 0">
+                        <joint name="gripper_right" type="slide" axis="0 -1 0" range="0 0.040"/>
+                        <geom name="right_finger_visual_rail" group="1" type="capsule" fromto="-0.073 0 0 -0.014 0 0" size="0.0075" material="mat_gripper_metal" contype="0" conaffinity="0"/>
+                        <geom name="right_finger_visual_knuckle" group="1" type="cylinder" pos="-0.058 0 0" euler="1.57079632679 0 0" size="0.014 0.009" material="mat_gripper_accent" contype="0" conaffinity="0"/>
+                        <geom name="right_finger_visual_pad" group="1" type="box" pos="-0.013 0 -0.002" size="0.010 0.0035 0.016" material="mat_gripper_pad" contype="0" conaffinity="0"/>
+                        <geom name="right_finger_visual_tip" group="1" type="capsule" fromto="-0.007 0 -0.016 -0.007 0 0.012" size="0.0045" material="mat_gripper_pad" contype="0" conaffinity="0"/>
+                        <geom name="right_finger_collision" group="2" contype="2" conaffinity="1" type="box" pos="-0.035 0 0" size="0.035 0.006 0.012" rgba="0 0 0 0"/>
+                      </body>
+                    </body>
+                  </body>
+                </body>
+              </body>
+            </body>
+          </body>
+        </body>
+      </body>
+    </body>
+
+    <!-- 三块 3×3×6 cm 积木；reset() 依据 scene_seed 将其散落到桌面。 -->
+    <body name="block_red" pos="0.16 -0.12 0.040">
+      <freejoint name="block_red_free"/>
+      <geom name="block_red_geom" type="box" size="0.030 0.015 0.015" mass="0.045" material="mat_block_red"/>
+    </body>
+    <body name="block_green" pos="0.20 0.0 0.040">
+      <freejoint name="block_green_free"/>
+      <geom name="block_green_geom" type="box" size="0.030 0.015 0.015" mass="0.045" material="mat_block_green"/>
+    </body>
+    <body name="block_blue" pos="0.25 0.12 0.040">
+      <freejoint name="block_blue_free"/>
+      <geom name="block_blue_geom" type="box" size="0.030 0.015 0.015" mass="0.045" material="mat_block_blue"/>
+    </body>
+    <body name="put1_bin" pos="0.235 -0.135 0.0">
+      <geom name="put1_floor" type="box" pos="0 0 0.003" size="0.065 0.050 0.003" material="mat_put1"/>
+      <geom name="put1_left_wall" type="box" pos="-0.065 0 0.018" size="0.003 0.050 0.018" material="mat_put1" contype="0" conaffinity="0"/>
+      <geom name="put1_right_wall" type="box" pos="0.065 0 0.018" size="0.003 0.050 0.018" material="mat_put1" contype="0" conaffinity="0"/>
+      <geom name="put1_back_wall" type="box" pos="0 0.050 0.018" size="0.065 0.003 0.018" material="mat_put1" contype="0" conaffinity="0"/>
+      <geom name="put1_front_wall" type="box" pos="0 -0.050 0.018" size="0.065 0.003 0.018" material="mat_put1" contype="0" conaffinity="0"/>
+      <site name="put1_green" type="cylinder" pos="-0.037 0 0.021" size="0.007 0.001" rgba="0.10 0.90 0.20 0.95"/>
+      <site name="put1_red" type="cylinder" pos="0.037 0 0.021" size="0.007 0.001" rgba="0.95 0.10 0.10 0.95"/>
+      <site name="put1_blue" type="cylinder" pos="0 0.035 0.021" size="0.007 0.001" rgba="0.10 0.28 0.95 0.95"/>
+    </body>
+  </worldbody>
+
+  <actuator>
+    <position name="joint1_act" joint="joint1" kp="200" ctrlrange="-2.4 2.4" forcerange="-21 21"/>
+    <position name="joint2_act" joint="joint2" kp="250" ctrlrange="0 3.2" forcerange="-36 36"/>
+    <position name="joint3_act" joint="joint3" kp="250" ctrlrange="0 4.0" forcerange="-36 36"/>
+    <position name="joint4_act" joint="joint4" kp="200" ctrlrange="-1.6 1.6" forcerange="-21 21"/>
+    <position name="joint5_act" joint="joint5" kp="150" ctrlrange="-1.7 1.7" forcerange="-10 10"/>
+    <position name="joint6_act" joint="joint6" kp="150" ctrlrange="-2.5 2.5" forcerange="-10 10"/>
+    <position name="gripper_left_act" joint="gripper_left" kp="120" ctrlrange="0 0.040" forcerange="-12 12"/>
+    <position name="gripper_right_act" joint="gripper_right" kp="120" ctrlrange="0 0.040" forcerange="-12 12"/>
+  </actuator>
+
+  <equality>
+    <joint name="gripper_sync" joint1="gripper_left" joint2="gripper_right" polycoef="0 1 0 0 0"/>
+  </equality>
+
+  <sensor>
+    <jointpos name="joint1_pos" joint="joint1"/>
+    <jointpos name="joint2_pos" joint="joint2"/>
+    <jointpos name="joint3_pos" joint="joint3"/>
+    <jointpos name="joint4_pos" joint="joint4"/>
+    <jointpos name="joint5_pos" joint="joint5"/>
+    <jointpos name="joint6_pos" joint="joint6"/>
+    <framepos name="tcp_position" objtype="site" objname="tcp"/>
+    <framepos name="grasp_position" objtype="site" objname="grasp_site"/>
+  </sensor>
+</mujoco>
