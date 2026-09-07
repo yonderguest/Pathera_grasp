@@ -15,3 +15,6 @@ build/
 dist/
 install/
 log/
+
+# MuJoCo 生成的 RGB-D、录像和合成训练输出。
+reports/mujoco_sim/
