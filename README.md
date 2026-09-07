@@ -4,6 +4,21 @@
 
 项目已经从“抓到物体后立即自动放置”改为两阶段流程：抓取成功后保持夹爪闭合并返回 HOME，进入 `FULL_LOAD`（持物待放）；操作者在网页点击“放置”后，机械臂才执行 PUT2/PUT1 放置序列。
 
+## 实机展示
+
+下面两张照片直接展示项目的整体硬件部署与彩色积木抓取场景。系统由 Panthera-HT 机械臂、腕部 RealSense D405、定制夹爪、IQ9075 计算平台和外部电源组成。
+
+<table>
+  <tr>
+    <td width="50%"><img src="docs/images/panthera_robot_overview.jpg" alt="Panthera-HT 机械臂视觉抓取整体部署"></td>
+    <td width="50%"><img src="docs/images/panthera_grasp_scene.jpg" alt="Panthera-HT 机械臂彩色积木抓取场景"></td>
+  </tr>
+  <tr>
+    <td align="center">整体硬件部署</td>
+    <td align="center">彩色积木抓取场景</td>
+  </tr>
+</table>
+
 > 安全结论：软件按钮、状态机、力矩判断和轨迹检查都不是硬件急停，也不能替代现场清场。项目没有完整环境建图或自碰撞规划。所有实机动作必须由现场操作者启动，并确保有人处于硬件急停可达位置。
 
 ## 第一次接触项目，先理解这五件事
@@ -33,17 +48,7 @@
 
 如果只想知道某项内容在哪里：运行方法见“环境与启动”，抓取/放置顺序见“系统工作流”，网页按钮见“网页端操作”，识别参数见“识别与标定”，报错排查见“日志与故障定位”，交付前检查见“归档检查清单”。
 
-## 项目实机与界面展示
-
-### Panthera-HT 实机部署
-
-下面两张照片分别展示整体硬件部署与实际抓取场景。系统由 Panthera-HT 机械臂、腕部 RealSense D405、定制夹爪、IQ9075 计算平台和外部电源组成，彩色积木用于视觉定位与夹取验证。
-
-![Panthera-HT 机械臂视觉抓取整体部署](docs/images/panthera_robot_overview.jpg)
-
-![Panthera-HT 机械臂彩色积木抓取场景](docs/images/panthera_grasp_scene.jpg)
-
-### 网页操作界面
+## 网页操作界面展示
 
 网页左侧显示实时画面或深度图，右侧显示 YOLO 识别结果；下方用于输入抓取目标、切换随动模式、执行持物放置以及安全结束程序。
 
