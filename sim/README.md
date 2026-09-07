@@ -14,6 +14,20 @@
 - Pinocchio 6D IK、预抓取、工具轴接近、双指接触、抬升和 PUT1 验证。
 - EGL 无窗口运行、外部视角录像、WSLg Viewer、虚拟 D405 窗口和浏览器控制台。
 
+## 运行效果
+
+### 任务开始：物块随机摆放
+
+![MuJoCo 任务开始时的随机物块场景与虚拟 D405 画面](../docs/images/mujoco_task_start.png)
+
+控制台进入 `ready` 状态后，可通过“随机重置场景”生成新的 `scene_seed`。左侧为 MuJoCo 外部视角，右侧为腕部虚拟 RealSense D405 RGB 画面。
+
+### 抓取红色物块
+
+![Panthera-HT 在 MuJoCo 中抓取红色物块](../docs/images/mujoco_red_block_grasp.png)
+
+抓取任务运行时，外部视角用于观察整机姿态和物块位置，腕部画面用于核对末端接近目标时的相机视野。截图中任务处于暂停状态，可通过网页继续执行。
+
 ## 与真机流程的区别
 
 当前 `sort` 是仿真专用的确定性集成回归：绿色、红色、蓝色会自动依次抓取并放到 PUT1。真机主线则是单目标抓取后进入 `FULL_LOAD`，回 HOME 保持夹紧，等待操作者点击“放置”，再执行 PUT2/PUT1 序列。
